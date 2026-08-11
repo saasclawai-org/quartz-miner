@@ -1,0 +1,23 @@
+# Quartz ESP32 Firmware — Component dependencies
+# Managed component manifest for ESP-IDF
+
+dependencies:
+  idf:
+    version: ">=5.1"
+
+  # TFT display driver for T-Display S3 (ST7789V 240×135)
+  bodmer/TFT_eSPI:
+    version: "~2.5.0"
+    override_path: "components/TFT_eSPI"
+
+  # Ed25519 + cryptographic primitives
+  espressif/esp_tinycrypt:
+    version: "~1.0.0"
+
+  # BLE stack (NimBLE — lighter than Bluedroid)
+  espressif/esp-nimble:
+    version: "~1.0.0"
+
+  # LoRa radio driver (SX1262 / SX1276)
+  jgromes/RadioLib:
+    version: "~7.0.0"

@@ -1,0 +1,399 @@
+/**
+ * Quartz Display UI — T-Display S3 Implementation
+ *
+ * Uses TFT_eSPI library for ST7789V display driver.
+ * 240×135 pixels, 16-bit color RGB565.
+ *
+ * Physical button: GPIO 0 (built-in BOOT button on T-Display S3)
+ *   - Short press: advance screen / confirm
+ *   - Long press (3s): cancel / reject
+ *
+ * Layout (240×135 landscape):
+ *   ┌──────────────────────────────┐
+ *   │  🔮 QUARTZ          [icon]   │  ← Header bar (18px)
+ *   ├──────────────────────────────┤
+ *   │                              │
+ *   │         CONTENT              │  ← Main area (95px)
+ *   │                              │
+ *   ├──────────────────────────────┤
+ *   │  ▲ confirm   ⛔ hold=reject  │  ← Footer hints (22px)
+ *   └──────────────────────────────┘
+ */
+
+#include "quartz_display.h"
+#include "quartz.h"
+#include <stdio.h>
+#include <string.h>
+
+// TFT_eSPI — configured via sdkconfig.defaults for ST7789V 240×135
+#ifdef ESP_PLATFORM
+#include "TFT_eSPI.h"
+#else
+/* Stub TFT types for non-TFT builds */
+#endif
+
+static TFT_eSPI tft = TFT_eSPI();
+static TFT_eSprite sprite = TFT_eSprite(&tft);
+static quartz_screen_t current_screen = QZ_SCREEN_BOOT;
+static uint8_t current_rotation = 0;
+
+// Colors (RGB565)
+#define COLOR_BG      0x10A2      // #0A0A0F — dark background
+#define COLOR_CARD    0x2126      // #1A1A2E — card surface
+#define COLOR_ACCENT  0x06EA      // #00D4AA — teal green
+#define COLOR_ORANGE  0xFD20      // #FF6B35
+#define COLOR_RED     0xF800      // #FF0000
+#define COLOR_TEXT    0xEF5D      // #E4E4EF
+#define COLOR_MUTED   0x8A62      // #8888A0
+#define COLOR_WHITE   0xFFFF
+
+#define SCREEN_W 240
+#define SCREEN_H 135
+#define HEADER_H 20
+#define FOOTER_H 18
+#define CONTENT_Y (HEADER_H + 4)
+#define CONTENT_H (SCREEN_H - HEADER_H - FOOTER_H - 8)
+
+// ============================================================
+// Init
+// ============================================================
+
+void quartz_display_init(void) {
+    tft.init();
+    tft.setRotation(current_rotation);
+    tft.fillScreen(COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
+
+    // Sprite for flicker-free updates
+    sprite.createSprite(SCREEN_W, CONTENT_H);
+    sprite.setTextColor(COLOR_TEXT, COLOR_BG);
+    sprite.setTextDatum(TL_DATUM);
+
+    quartz_display_backlight_on();
+}
+
+void quartz_display_backlight_on(void) {
+    // T-Display S3 backlight: GPIO 38 (PWM via LEDC)
+    // TFT_eSPI handles this via tft.writecommand()
+    ledcSetup(0, 5000, 8);
+    ledcAttachPin(38, 0);
+    ledcWrite(0, 200);  // 0-255 brightness
+}
+
+void quartz_display_backlight_off(void) {
+    ledcWrite(0, 0);
+}
+
+void quartz_display_set_rotation(uint8_t rotation) {
+    current_rotation = rotation;
+    tft.setRotation(rotation);
+}
+
+// ============================================================
+// Drawing helpers
+// ============================================================
+
+static void draw_header(const char *title) {
+    tft.fillRect(0, 0, SCREEN_W, HEADER_H, COLOR_CARD);
+    tft.drawFastHLine(0, HEADER_H, SCREEN_W, 0x4228); // subtle border
+    tft.setTextColor(COLOR_ACCENT, COLOR_CARD);
+    tft.setTextSize(1);
+    tft.setCursor(6, 5);
+    tft.print("QZ ");
+    tft.setTextColor(COLOR_TEXT, COLOR_CARD);
+    tft.print(title);
+}
+
+static void draw_footer(const char *hint) {
+    tft.fillRect(0, SCREEN_H - FOOTER_H, SCREEN_W, FOOTER_H, COLOR_CARD);
+    tft.drawFastHLine(0, SCREEN_H - FOOTER_H, SCREEN_W, 0x4228);
+    tft.setTextColor(COLOR_MUTED, COLOR_CARD);
+    tft.setTextSize(1);
+    tft.setCursor(6, SCREEN_H - FOOTER_H + 5);
+    tft.print(hint);
+}
+
+static void clear_content(void) {
+    tft.fillRect(0, HEADER_H, SCREEN_W, SCREEN_H - HEADER_H - FOOTER_H, COLOR_BG);
+}
+
+// ============================================================
+// Boot Screen
+// ============================================================
+
+void quartz_display_show_boot(void) {
+    current_screen = QZ_SCREEN_BOOT;
+    tft.fillScreen(COLOR_BG);
+
+    // Logo
+    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft.setTextSize(3);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("QUARTZ", SCREEN_W / 2, SCREEN_H / 2 - 12);
+
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    tft.setTextSize(1);
+    tft.drawString("ESP32 Crystal Miner v" QUARTZ_VERSION_STR, SCREEN_W / 2, SCREEN_H / 2 + 16);
+
+    tft.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// Mining Screen
+// ============================================================
+
+void quartz_display_show_mining(uint32_t hashrate, uint32_t blocks_found,
+                                 uint32_t uptime_sec, int8_t temp_c) {
+    if (current_screen != QZ_SCREEN_MINING) {
+        current_screen = QZ_SCREEN_MINING;
+        tft.fillScreen(COLOR_BG);
+    }
+
+    draw_header("MINING");
+
+    char buf[32];
+
+    // Hashrate — big, center
+    clear_content();
+    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    snprintf(buf, sizeof(buf), "%lu H/s", (unsigned long)hashrate);
+    tft.drawString(buf, SCREEN_W / 2, CONTENT_Y + 16);
+
+    // Stats row
+    tft.setTextSize(1);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+
+    uint32_t hrs = uptime_sec / 3600;
+    uint32_t mins = (uptime_sec % 3600) / 60;
+    snprintf(buf, sizeof(buf), "UP %luh %lum", (unsigned long)hrs, (unsigned long)mins);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(buf, 10, CONTENT_Y + 42);
+
+    snprintf(buf, sizeof(buf), "BLK %lu", (unsigned long)blocks_found);
+    tft.drawString(buf, 10, CONTENT_Y + 54);
+
+    snprintf(buf, sizeof(buf), "%dC", temp_c);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(buf, SCREEN_W - 10, CONTENT_Y + 54);
+
+    tft.setTextDatum(TL_DATUM);
+
+    draw_footer("BTN: wallet  HOLD: wipe");
+}
+
+// ============================================================
+// Seed Phrase Screen (ONE-TIME display)
+// ============================================================
+
+void quartz_display_show_seed(const char words[12][12], int page) {
+    current_screen = QZ_SCREEN_SEED;
+    tft.fillScreen(COLOR_BG);
+
+    draw_header("SEED BACKUP");
+
+    // 4 words per page, 3 pages
+    // Page 0: words 1-4, Page 1: 5-8, Page 2: 9-12
+    int start = page * 4;
+    int y = CONTENT_Y;
+
+    tft.setTextColor(COLOR_ORANGE, COLOR_BG);
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+
+    if (page == 0) {
+        tft.drawString("WRITE THESE DOWN!", 10, y);
+        tft.setTextColor(COLOR_MUTED, COLOR_BG);
+        tft.drawString("Never shown again", 10, y + 12);
+        y += 28;
+    }
+
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.setTextSize(2);
+
+    for (int i = 0; i < 4 && (start + i) < 12; i++) {
+        char line[20];
+        snprintf(line, sizeof(line), "%d. %s", start + i + 1, words[start + i]);
+        tft.drawString(line, 14, y);
+        y += 20;
+    }
+
+    tft.setTextSize(1);
+    char footer[32];
+    snprintf(footer, sizeof(footer), "%d/3  BTN: next  HOLD: done", page + 1);
+    draw_footer(footer);
+}
+
+// ============================================================
+// Sign Confirmation Screen
+// ============================================================
+
+void quartz_display_show_sign_request(const char *to_address, uint64_t amount_sats,
+                                       uint64_t fee_sats) {
+    current_screen = QZ_SCREEN_SIGN;
+    tft.fillScreen(COLOR_BG);
+
+    draw_header("CONFIRM SEND");
+
+    char buf[32];
+    int y = CONTENT_Y;
+
+    // Amount (convert sats to QZ for display)
+    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    double qz = amount_sats / 100000000.0;
+    snprintf(buf, sizeof(buf), "%.4f QZ", qz);
+    tft.drawString(buf, SCREEN_W / 2, y + 8);
+    tft.setTextDatum(TL_DATUM);
+
+    // To address (truncated)
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    tft.setTextSize(1);
+    tft.drawString("TO:", 10, y + 30);
+
+    // Show first 8 and last 6 chars of address
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    char addr_short[20];
+    size_t addr_len = strlen(to_address);
+    if (addr_len > 16) {
+        snprintf(addr_short, sizeof(addr_short), "%.8s...%s", to_address, to_address + addr_len - 6);
+    } else {
+        strncpy(addr_small, to_address, sizeof(addr_short) - 1);
+    }
+    tft.drawString(addr_short, 10, y + 42);
+
+    // Fee
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    snprintf(buf, sizeof(buf), "Fee: %llu sats", (unsigned long long)fee_sats);
+    tft.drawString(buf, 10, y + 56);
+
+    draw_footer("BTN: approve  HOLD: reject");
+}
+
+// ============================================================
+// Address Display
+// ============================================================
+
+void quartz_display_show_address(const char *address) {
+    current_screen = QZ_SCREEN_ADDRESS;
+    tft.fillScreen(COLOR_BG);
+
+    draw_header("ADDRESS");
+
+    // Show full address in small font, wrapped
+    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft.setTextSize(1);
+    tft.setTextDatum(TL_DATUM);
+
+    int y = CONTENT_Y + 4;
+    int x = 10;
+    for (size_t i = 0; i < strlen(address); i++) {
+        char ch[2] = { address[i], 0 };
+        tft.drawString(ch, x, y);
+        x += 6;
+        if (x > SCREEN_W - 10) {
+            x = 10;
+            y += 12;
+        }
+    }
+
+    draw_footer("BTN: back to mining");
+}
+
+// ============================================================
+// Wiped Screen
+// ============================================================
+
+void quartz_display_show_wiped(void) {
+    current_screen = QZ_SCREEN_WIPED;
+    tft.fillScreen(COLOR_BG);
+
+    tft.setTextColor(COLOR_RED, COLOR_BG);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("WIPED", SCREEN_W / 2, SCREEN_H / 2 - 10);
+
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    tft.setTextSize(1);
+    tft.drawString("Device reset to factory", SCREEN_W / 2, SCREEN_H / 2 + 12);
+    tft.drawString("Power cycle to set up again", SCREEN_W / 2, SCREEN_H / 2 + 24);
+
+    tft.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// Locked Screen
+// ============================================================
+
+void quartz_display_show_locked(void) {
+    current_screen = QZ_SCREEN_LOCKED;
+    tft.fillScreen(COLOR_BG);
+
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    tft.setTextSize(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("LOCKED", SCREEN_W / 2, SCREEN_H / 2 - 6);
+
+    tft.setTextSize(1);
+    tft.drawString("Press button to unlock", SCREEN_W / 2, SCREEN_H / 2 + 16);
+
+    tft.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// Signing Result
+// ============================================================
+
+void quartz_display_show_signing_result(bool success) {
+    if (success) {
+        tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
+        tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+        tft.setTextSize(2);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("SIGNED", SCREEN_W / 2, SCREEN_H / 2);
+    } else {
+        tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
+        tft.setTextColor(COLOR_RED, COLOR_BG);
+        tft.setTextSize(2);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString("REJECTED", SCREEN_W / 2, SCREEN_H / 2);
+    }
+    tft.setTextDatum(TL_DATUM);
+}
+
+// ============================================================
+// Button Handling (GPIO 0 — T-Display S3 built-in BOOT button)
+// ============================================================
+
+#define BUTTON_GPIO     0
+#define LONG_PRESS_MS   3000
+#define DEBOUNCE_MS     50
+
+static uint32_t button_press_time = 0;
+static bool button_was_pressed = false;
+
+quartz_button_t quartz_button_poll(void) {
+    bool pressed = (digitalRead(BUTTON_GPIO) == LOW);
+
+    if (pressed && !button_was_pressed) {
+        button_press_time = millis();
+        button_was_pressed = true;
+        return QZ_BTN_NONE; // wait for release
+    }
+
+    if (!pressed && button_was_pressed) {
+        uint32_t duration = millis() - button_press_time;
+        button_was_pressed = false;
+
+        if (duration >= LONG_PRESS_MS) {
+            return QZ_BTN_LONG;
+        } else if (duration >= DEBOUNCE_MS) {
+            return QZ_BTN_SHORT;
+        }
+    }
+
+    return QZ_BTN_NONE;
+}
