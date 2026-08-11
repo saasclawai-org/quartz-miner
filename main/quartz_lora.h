@@ -81,17 +81,17 @@ typedef enum {
 // Packet Structure (fits in 242 bytes)
 // ============================================================
 
-// All LoRa packets have this 8-byte header
+// All LoRa packets have this header (10 bytes)
 typedef struct __attribute__((packed)) {
     uint8_t  type;         // qz_lora_pkt_type_t
     uint8_t  ttl;          // decremented at each hop, dropped at 0
     uint8_t  sender_id[6]; // ESP32 MAC address (last 6 bytes)
     uint8_t  hop_count;    // incremented at each forward
-    uint8_t  reserved;     // alignment
     uint16_t payload_len;  // payload length in bytes
+    uint16_t seq;          // sequence number for dedup
 } qz_lora_header_t;
 
-#define QZ_LORA_HEADER_SIZE   8
+#define QZ_LORA_HEADER_SIZE   12
 #define QZ_LORA_MAX_PAYLOAD   (QZ_LORA_TX_BUFFER_SIZE - QZ_LORA_HEADER_SIZE)
 
 // Beacon payload (12 bytes)
@@ -134,6 +134,7 @@ typedef struct {
     uint32_t known_height;      // their best block height
     uint8_t  capabilities;
     bool     active;
+    uint32_t first_seen_sec;    // when first discovered
 } qz_lora_peer_t;
 
 // ============================================================
@@ -228,6 +229,28 @@ typedef struct {
 } qz_lora_stats_t;
 
 void quartz_lora_get_stats(qz_lora_stats_t *stats);
+
+/**
+ * Replay stored packets (store-and-forward for late peers).
+ * @param max_packets  Maximum packets to replay
+ * @return Number of packets replayed
+ */
+int quartz_lora_replay_stored(int max_packets);
+
+/**
+ * Get radio link quality info.
+ */
+int16_t quartz_lora_get_rssi(void);
+
+/**
+ * Channel Activity Detection — check if LoRa signal present.
+ */
+bool quartz_lora_channel_busy(uint32_t timeout_ms);
+
+/**
+ * Send a ping to test mesh connectivity.
+ */
+int quartz_lora_ping(void);
 
 #ifdef __cplusplus
 }

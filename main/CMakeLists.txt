@@ -16,6 +16,7 @@ idf_component_register(
         "quartz_pay.c"
         "quartz_qr.c"
         "quartz_agent.c"
+        "quartz_sx1276.c"
         "ed25519-lib/add_scalar.c"
         "ed25519-lib/fe.c"
         "ed25519-lib/ge.c"
