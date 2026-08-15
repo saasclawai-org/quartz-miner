@@ -175,7 +175,7 @@ void quartz_display_init(void) {
     buscfg.miso_io_num = -1;   /* No MISO — write-only display */
     buscfg.sclk_io_num = PIN_CLK;
     buscfg.max_transfer_sz = DISP_W * DISP_H * 2 + 8;
-    spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
     spi_device_interface_config_t devcfg = {0};
     devcfg.clock_speed_hz = 27 * 1000 * 1000;  /* 27MHz — M5Stack standard */
@@ -183,7 +183,7 @@ void quartz_display_init(void) {
     devcfg.spics_io_num = PIN_CS;
     devcfg.queue_size = 7;
     /* NO HALFDUPLEX flag — ILI9341 uses standard 4-wire SPI */
-    spi_bus_add_device(HSPI_HOST, &devcfg, &s_spi);
+    spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi);
 
     /* Hardware reset */
     gpio_set_level(PIN_RST, 0);

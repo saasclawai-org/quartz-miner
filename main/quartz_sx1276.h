@@ -145,7 +145,7 @@ typedef enum {
 
 typedef struct {
     // SPI pins
-    int spi_host;       // HSPI_HOST (2) or VSPI_HOST (3)
+    int spi_host;       // SPI2_HOST (2) or VSPI_HOST (3)
     int pin_sck;
     int pin_miso;
     int pin_mosi;
