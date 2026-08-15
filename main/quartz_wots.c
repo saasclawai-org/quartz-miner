@@ -316,6 +316,7 @@ static bool load_wallet_state(uint8_t seed[32], qz_qwallet_t *wallet) {
     memcpy(wallet->merkle_root, blob + 32, 32);
     wallet->next_ots_index = blob[64] | (blob[65] << 8);
     wallet->max_ots_index = QZ_MERKLE_LEAVES;
+    wallet->rotation_mode = false;
     wallet->initialized = true;
     return true;
 }
@@ -363,6 +364,7 @@ int quartz_qwallet_create(const uint8_t seed[32], qz_qwallet_t *wallet) {
     merkle_root_from_leaves(leaves, wallet->merkle_root);
     wallet->next_ots_index = 0;
     wallet->max_ots_index = QZ_MERKLE_LEAVES;
+    wallet->rotation_mode = false;
     wallet->initialized = true;
 
     /* Save to NVS */
@@ -378,6 +380,7 @@ int quartz_qwallet_create(const uint8_t seed[32], qz_qwallet_t *wallet) {
     memset(wallet->merkle_root, 0, QZ_QADDR_SIZE);
     wallet->next_ots_index = 0;
     wallet->max_ots_index = QZ_MERKLE_LEAVES;
+    wallet->rotation_mode = false;
     wallet->initialized = true;
     return 0;
 #endif
@@ -395,6 +398,7 @@ int quartz_qwallet_load(qz_qwallet_t *wallet) {
 #else
     wallet->next_ots_index = 0;
     wallet->max_ots_index = QZ_MERKLE_LEAVES;
+    wallet->rotation_mode = false;
     wallet->initialized = true;
     return 0;
 #endif
@@ -407,9 +411,12 @@ int quartz_qwallet_sign(
     size_t *sig_len
 ) {
 #ifdef ESP_PLATFORM
-    if (!wallet->initialized || wallet->next_ots_index >= wallet->max_ots_index) {
-        ESP_LOGE(TAG, "No OTS keys remaining (used %d/%d)",
-                 wallet->next_ots_index, wallet->max_ots_index);
+    /* Regular signing: refuse if only the reserved rotation sig is left */
+    int total_left = wallet->max_ots_index - wallet->next_ots_index;
+    if (!wallet->initialized || total_left <= QZ_RESERVED_ROTATION_SIG) {
+        ESP_LOGE(TAG, "No spendable OTS keys remaining (used %d/%d, %d reserved for rotation)",
+                 wallet->next_ots_index, wallet->max_ots_index, QZ_RESERVED_ROTATION_SIG);
+        ESP_LOGE(TAG, "Use key rotation to transfer funds to a new address!");
         return -1;
     }
 
@@ -486,6 +493,99 @@ int quartz_qwallet_sign(
 #endif
 }
 
+int quartz_qwallet_sign_rotation(
+    const qz_qwallet_t *wallet,
+    const uint8_t msg_hash[32],
+    uint8_t *sig_out,
+    size_t *sig_len
+) {
+#ifdef ESP_PLATFORM
+    /* Rotation signing: uses the reserved last OTS key (#255 = 256th sig) */
+    int total_left = wallet->max_ots_index - wallet->next_ots_index;
+    if (!wallet->initialized || total_left < 1) {
+        ESP_LOGE(TAG, "No OTS keys remaining at all (used %d/%d) — funds may be stuck!",
+                 wallet->next_ots_index, wallet->max_ots_index);
+        return -1;
+    }
+    if (total_left > QZ_RESERVED_ROTATION_SIG) {
+        ESP_LOGW(TAG, "Rotation called early (used %d/%d) — continuing anyway",
+                 wallet->next_ots_index, wallet->max_ots_index);
+    }
+
+    ESP_LOGI(TAG, "KEY ROTATION: signing self-transfer with OTS key %d/%d (reserved)",
+             wallet->next_ots_index, wallet->max_ots_index);
+
+    /* Mark rotation mode */
+    ((qz_qwallet_t *)wallet)->rotation_mode = true;
+
+    /* Same signing logic as regular sign */
+    int ots_idx = wallet->next_ots_index;
+
+    /* Load seed from NVS */
+    uint8_t seed[32];
+    qz_qwallet_t tmp_wallet;
+    if (!load_wallet_state(seed, &tmp_wallet)) {
+        ESP_LOGE(TAG, "Failed to load seed");
+        return -1;
+    }
+
+    /* Derive this OTS keypair's seed */
+    uint8_t ots_seed[32];
+    uint8_t buf[36];
+    memcpy(buf, seed, 32);
+    buf[32] = ots_idx & 0xFF;
+    buf[33] = (ots_idx >> 8) & 0xFF;
+    buf[34] = 0;
+    buf[35] = 0;
+    sha256(buf, 36, ots_seed);
+
+    /* Generate private key */
+    uint8_t privkey[QZ_WOTS_TOTAL * QZ_WOTS_HASH_SIZE];
+    wots_gen_privkey(ots_seed, privkey);
+
+    /* Create WOTS+ signature */
+    uint8_t *wots_sig = sig_out;
+    wots_sign(privkey, msg_hash, wots_sig);
+
+    /* Compute Merkle auth path */
+    uint8_t leaves[QZ_MERKLE_LEAVES][QZ_WOTS_HASH_SIZE];
+    uint8_t pubkey[QZ_WOTS_TOTAL * QZ_WOTS_HASH_SIZE];
+    uint8_t privkey_tmp[QZ_WOTS_TOTAL * QZ_WOTS_HASH_SIZE];
+
+    for (int k = 0; k < QZ_MERKLE_LEAVES; k++) {
+        uint8_t k_seed[32];
+        memcpy(buf, seed, 32);
+        buf[32] = k & 0xFF;
+        buf[33] = (k >> 8) & 0xFF;
+        sha256(buf, 36, k_seed);
+        wots_gen_privkey(k_seed, privkey_tmp);
+        wots_gen_pubkey(privkey_tmp, pubkey);
+        merkle_leaf(pubkey, leaves[k]);
+    }
+
+    uint8_t *auth = sig_out + QZ_WOTS_SIG_SIZE;
+    merkle_auth_path(leaves, ots_idx, auth);
+
+    uint32_t idx_le = ots_idx;
+    memcpy(sig_out + QZ_WOTS_SIG_SIZE + QZ_MERKLE_AUTH_SIZE, &idx_le, 4);
+
+    *sig_len = QZ_QSIG_SIZE;
+
+    ESP_LOGI(TAG, "Rotation signature: %d bytes — FUNDS MUST BE MOVED TO NEW ADDRESS NOW",
+             (int)*sig_len);
+
+    /* Advance OTS index in NVS — wallet is now exhausted */
+    ((qz_qwallet_t *)wallet)->next_ots_index++;
+    save_wallet_state(wallet, seed);
+
+    return 0;
+#else
+    *sig_len = QZ_QSIG_SIZE;
+    memset(sig_out, 0, *sig_len);
+    return 0;
+#endif
+}
+
 int quartz_qwallet_verify(
     const uint8_t merkle_root[QZ_QADDR_SIZE],
     const uint8_t msg_hash[32],
@@ -534,11 +634,27 @@ const char *quartz_qwallet_address_hex(const qz_qwallet_t *wallet) {
 
 int quartz_qwallet_remaining(const qz_qwallet_t *wallet) {
     if (!wallet->initialized) return 0;
+    int total = wallet->max_ots_index - wallet->next_ots_index;
+    /* Subtract reserved rotation signature — can't spend it normally */
+    if (total > QZ_RESERVED_ROTATION_SIG)
+        return total - QZ_RESERVED_ROTATION_SIG;
+    return 0;  /* only the reserved sig left, or none */
+}
+
+int quartz_qwallet_remaining_total(const qz_qwallet_t *wallet) {
+    if (!wallet->initialized) return 0;
     return wallet->max_ots_index - wallet->next_ots_index;
 }
 
+int quartz_qwallet_rotation_status(const qz_qwallet_t *wallet) {
+    if (!wallet->initialized) return 0;
+    if (wallet->next_ots_index >= 254)
+        return 2;  /* urgent: only regular sig + reserved left */
+    if (wallet->next_ots_index >= 240)
+        return 1;  /* warn: rotation coming soon */
+    return 0;
+}
+
 bool quartz_qwallet_needs_rotation(const qz_qwallet_t *wallet) {
-    /* Warn at sig #240 to give time to rotate before hitting #256 */
-    if (!wallet->initialized) return false;
-    return wallet->next_ots_index >= 240;
+    return quartz_qwallet_rotation_status(wallet) >= 1;
 }

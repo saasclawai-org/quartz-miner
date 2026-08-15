@@ -115,6 +115,19 @@ int quartz_messages_send(const char *from, const char *to, const char *text);
 int quartz_http_request(const char *method, const char *path,
                          const char *body, char *response, size_t resp_size);
 
+/* === Captive Portal Seed Provisioning === */
+
+/**
+ * Set seed phrase for captive portal /seed endpoint.
+ * Called by main.c after wallet creation.
+ */
+void quartz_wifi_portal_set_seed(const char words[12][12], const char *address);
+
+/**
+ * Check if seed was confirmed via captive portal.
+ */
+bool quartz_wifi_portal_seed_confirmed(void);
+
 #ifdef __cplusplus
 }
 #endif

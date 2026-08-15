@@ -37,6 +37,22 @@ void quartz_display_init(void);
 /* Clear screen with color */
 void quartz_display_clear(uint16_t color);
 
+/* Identity screen — boot default. Hero: enrollment status + device ID.
+ * Hashrate intentionally demoted to a small line. */
+void quartz_display_id_screen(
+    bool enrolled,
+    const uint8_t device_id[32],
+    uint32_t uptime_sec,
+    uint32_t hash_rate,
+    const char *wallet_address);
+
+/* Fleet screen — network progress toward the 100-device goal. */
+void quartz_display_fleet_screen(
+    uint32_t member_count,
+    uint32_t my_shares,
+    uint64_t rewards_qz_milli,
+    uint32_t blocks_found);
+
 /* Fill a rectangle */
 void quartz_display_fill_rect(int x, int y, int w, int h, uint16_t color);
 
@@ -48,6 +64,15 @@ void quartz_display_draw_text(int x, int y, const char *text, uint16_t fg, uint1
 
 /* Draw larger text (16x32 bold digits for stats) */
 void quartz_display_draw_big_text(int x, int y, const char *text, uint16_t fg, uint16_t bg);
+
+/* Draw huge text (32x64 for titles) */
+void quartz_display_draw_huge_text(int x, int y, const char *text, uint16_t fg, uint16_t bg);
+
+/* Draw text with DejaVu Sans 12px (small, clean) */
+void quartz_display_draw_text_s(int x, int y, const char *text, uint16_t fg, uint16_t bg);
+
+/* Draw text with DejaVu Sans 16px (large, clean) */
+void quartz_display_draw_text_l(int x, int y, const char *text, uint16_t fg, uint16_t bg);
 
 /* Draw a horizontal line */
 void quartz_display_draw_hline(int x, int y, int w, uint16_t color);
@@ -88,15 +113,31 @@ void quartz_display_qr_payment(const char *address, float amount);
 
 /* Screen navigation */
 typedef enum {
-    QZ_SCREEN_MINING = 0,
-    QZ_SCREEN_WALLET = 1,
-    QZ_SCREEN_MESSAGES = 2,
-    QZ_SCREEN_PAYMENT = 3,
+    QZ_SCREEN_ID = 0,          /* Identity — boot default */
+    QZ_SCREEN_MINING = 1,
+    QZ_SCREEN_FLEET = 2,       /* Fleet / network progress */
+    QZ_SCREEN_WALLET = 3,
+    QZ_SCREEN_MESSAGES = 4,
+    QZ_SCREEN_PAYMENT = 5,
+    QZ_SCREEN_PIN_ENTRY = 6,
+    QZ_SCREEN_RECOVERY = 7,
     QZ_SCREEN_COUNT,
 } qz_screen_t;
 
 void quartz_display_set_screen(qz_screen_t screen);
 qz_screen_t quartz_display_get_screen(void);
+
+/* PIN entry screen — shows entered PIN as dots, attempts left */
+void quartz_display_pin_entry(const char *entered_pin, int attempts_left);
+
+/* PIN entry M5Stack mode — big digit, 3-button navigation */
+void quartz_display_pin_entry_m5stack(int digit, int pin_len, int attempts_left);
+
+/* Recovery screens */
+void quartz_display_recovery_start(void);
+void quartz_display_recovery_sync(const char *address);
+void quartz_display_recovery_done(const char *address, int sig_index, int balance);
+void quartz_display_recovery_error(const char *msg);
 
 #ifdef __cplusplus
 }

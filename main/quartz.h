@@ -52,7 +52,7 @@ typedef int qz_err_t;
 #define QUARTZ_MAX_TX_PER_BLOCK 255
 #define QUARTZ_BLOCK_SIZE_MAX   4096
 #define QUARTZ_SCRATCHPAD_SIZE  (256 * 1024)  /* 256KB (PSRAM) */
-#define QUARTZ_SCRATCHPAD_SIZE_LITE  (32 * 1024)  /* 32KB fallback (no PSRAM) */
+#define QUARTZ_SCRATCHPAD_SIZE_LITE  (16 * 1024)  /* 16KB fallback (no PSRAM, BLE needs RAM) */
 
 /* --- Block header (80 bytes) --- */
 #define QUARTZ_HEADER_SIZE 80

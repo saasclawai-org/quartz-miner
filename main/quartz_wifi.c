@@ -38,6 +38,13 @@
 
 static const char *TAG = "QZ.WIFI";
 
+/* Seed phrase for portal display (set by main.c after wallet creation) */
+static char s_portal_seed[12][12] = {0};
+static char s_portal_address[64] = {0};
+static bool s_portal_seed_available = false;
+static bool s_portal_seed_confirmed = false;
+static int s_portal_challenge_idx = 0;  /* random word index for confirmation */
+
 /* Node configuration */
 #define NODE_HOST   "quartz.preview.saasclaw.ai"
 #define NODE_PORT   80
@@ -260,6 +267,13 @@ static void portal_task(void *pv) {
             }
         }
 
+        /* NOTE: Seed phrase is NO LONGER served over WiFi/captive portal.
+         * Seed is only available via:
+         *   1. Serial QR code (scan with phone app)
+         *   2. Device display QR code (M5Stack)
+         *   3. BLE (bonded devices only)
+         * This is a security hardening — WiFi is plaintext, anyone nearby can sniff. */
+
         /* Serve the portal page */
         send(csock, PORTAL_HTML, strlen(PORTAL_HTML), 0);
         close(csock);
@@ -379,7 +393,7 @@ static int http_request(const char *method, const char *path,
     }
     struct in_addr **addr_list = (struct in_addr **)he->h_addr_list;
     addr.sin_addr = *addr_list[0];
-    ESP_LOGI(TAG, "DNS: %s -> %s", NODE_HOST, inet_ntoa(addr.sin_addr));
+    ESP_LOGD(TAG, "DNS: %s -> %s", NODE_HOST, inet_ntoa(addr.sin_addr));
 
     /* Set timeout */
     struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
@@ -514,8 +528,12 @@ int quartz_mining_get_work(qz_block_template_t *tmpl) {
     json_find_string(response, "job_id", tmpl->job_id, sizeof(tmpl->job_id));
 
     g_mining_state = QZ_MINING_HAS_WORK;
-    ESP_LOGI(TAG, "Got work: height=%d job=%s target=%d",
-             tmpl->height, tmpl->job_id, tmpl->target_bits);
+    /* Log only on new block height — job refreshes of the same block stay quiet */
+    static int s_last_logged_height = -1;
+    if ((int)tmpl->height != s_last_logged_height) {
+        s_last_logged_height = (int)tmpl->height;
+        ESP_LOGI(TAG, "Got work: height=%d target=%d", tmpl->height, tmpl->target_bits);
+    }
 
     return 0;
 }
@@ -642,6 +660,25 @@ int quartz_messages_send(const char *from, const char *to, const char *text) {
     }
 
     return 0;
+}
+
+/* ============================================================
+ * Captive Portal Seed Phrase Provisioning
+ * ============================================================ */
+
+void quartz_wifi_portal_set_seed(const char words[12][12], const char *address) {
+    memcpy(s_portal_seed, words, sizeof(s_portal_seed));
+    strncpy(s_portal_address, address ? address : "", sizeof(s_portal_address) - 1);
+    s_portal_seed_available = true;
+    s_portal_seed_confirmed = false;
+    /* Pick random challenge word for verification */
+    s_portal_challenge_idx = esp_random() % 12;
+    ESP_LOGI(TAG, "Seed phrase loaded into captive portal (visit /seed, challenge word #%d)",
+             s_portal_challenge_idx + 1);
+}
+
+bool quartz_wifi_portal_seed_confirmed(void) {
+    return s_portal_seed_confirmed;
 }
 
 #endif /* ESP_PLATFORM */

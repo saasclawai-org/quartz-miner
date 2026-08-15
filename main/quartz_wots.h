@@ -57,12 +57,16 @@ extern "C" {
 /* Address = Merkle root (32 bytes) — like a Bitcoin address but quantum-safe */
 #define QZ_QADDR_SIZE       32
 
+/* Last signature is reserved for key rotation (self-transfer to next address) */
+#define QZ_RESERVED_ROTATION_SIG 1
+
 /* === State tracking === */
 typedef struct {
     uint8_t  merkle_root[QZ_QADDR_SIZE];   /* quantum address */
     uint16_t next_ots_index;                /* which one-time key to use next */
     uint16_t max_ots_index;                 /* QZ_MERKLE_LEAVES */
     bool     initialized;
+    bool     rotation_mode;                 /* true = signing a self-transfer for key rotation */
 } qz_qwallet_t;
 
 /* === API === */
@@ -85,14 +89,35 @@ int quartz_qwallet_load(qz_qwallet_t *wallet);
 
 /**
  * Sign a message (transaction hash) with the next available OTS key.
+ * The last signature (#256) is RESERVED for key rotation self-transfer.
+ * Regular signing stops at #255. Use quartz_qwallet_sign_rotation() for the
+ * final self-transfer to the next derived address.
  *
  * @param wallet     Wallet state (will advance next_ots_index)
  * @param msg_hash   32-byte message hash to sign
  * @param sig_out    Output buffer of QZ_QSIG_SIZE bytes
  * @param sig_len    Output: actual signature length
- * @return 0 on success, -1 if no OTS keys left
+ * @return 0 on success, -1 if no OTS keys left (or only reserved sig remains)
  */
 int quartz_qwallet_sign(
+    const qz_qwallet_t *wallet,
+    const uint8_t msg_hash[32],
+    uint8_t *sig_out,
+    size_t *sig_len
+);
+
+/**
+ * Sign a key-rotation self-transfer using the reserved last OTS key.
+ * This is the ONLY way to use the final signature (#256).
+ * After this call, the wallet MUST be rotated to the next address.
+ *
+ * @param wallet     Wallet state (will advance to max_ots_index)
+ * @param msg_hash   32-byte message hash (the self-transfer tx)
+ * @param sig_out    Output buffer of QZ_QSIG_SIZE bytes
+ * @param sig_len    Output: actual signature length
+ * @return 0 on success, -1 if no reserved signature available
+ */
+int quartz_qwallet_sign_rotation(
     const qz_qwallet_t *wallet,
     const uint8_t msg_hash[32],
     uint8_t *sig_out,
@@ -122,13 +147,28 @@ int quartz_qwallet_verify(
 const char *quartz_qwallet_address_hex(const qz_qwallet_t *wallet);
 
 /**
- * Get remaining signatures.
+ * Get remaining signatures (excluding the reserved rotation signature).
+ * Reports 255 max, not 256 — the last one is reserved.
  */
 int quartz_qwallet_remaining(const qz_qwallet_t *wallet);
 
 /**
- * Check if wallet needs key rotation ( approaching WOTS+ limit).
- * Returns true at signature #240. Hard limit is #256.
+ * Get remaining signatures including the reserved one.
+ * Used internally for rotation logic and diagnostics.
+ */
+int quartz_qwallet_remaining_total(const qz_qwallet_t *wallet);
+
+/**
+ * Check if wallet needs key rotation (approaching WOTS+ limit).
+ * - Returns 1 (warn) at signature #240: "Key rotation needed"
+ * - Returns 2 (urgent) at signature #254: "Rotation required — last sig reserved"
+ * @return 0 = fine, 1 = warn, 2 = urgent
+ */
+int quartz_qwallet_rotation_status(const qz_qwallet_t *wallet);
+
+/**
+ * Legacy bool wrapper for backward compat.
+ * Returns true if rotation_status >= 1.
  */
 bool quartz_qwallet_needs_rotation(const qz_qwallet_t *wallet);
 

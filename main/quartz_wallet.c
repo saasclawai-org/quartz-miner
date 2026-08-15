@@ -41,6 +41,8 @@ static const char *TAG = "QUARTZ_WALLET";
 static uint8_t s_private_key[ED25519_PRIVATE_KEY_SIZE];
 static uint8_t s_public_key[ED25519_PUBLIC_KEY_SIZE];
 static char s_address[36];  // Base58 address string
+static char s_mnemonic_words[12][12];
+static bool s_is_testnet = true;        // network of the loaded/generated wallet  // BIP39 mnemonic (persisted to NVS)
 static bool s_wallet_initialized = false;
 
 // ============================================================
@@ -50,11 +52,20 @@ static bool s_wallet_initialized = false;
 #define NVS_KEY_PRIV  "priv_key"
 #define NVS_KEY_PUB   "pub_key"
 #define NVS_KEY_FLAGS "flags"
+#define NVS_KEY_PIN_HASH  "pin_hash"   // 32 bytes SHA-256(salt + pin)
+#define NVS_KEY_PIN_SALT  "pin_salt"   // 16 bytes random salt
+#define NVS_KEY_PIN_FAIL  "pin_fails"  // uint8_t failed attempt count
+#define NVS_KEY_MNEMONIC  "mnemonic"   // 12 words × 12 bytes = 144 bytes
+
+#define PIN_MAX_ATTEMPTS  10
+
+static uint8_t s_pin_attempts = 0;
 
 // Flag bits
 #define FLAG_MINING_ENABLED  0x01
 #define FLAG_TESTNET         0x02
 #define FLAG_BACKED_UP       0x04  // user confirmed seed phrase backup
+#define FLAG_HAS_PIN         0x08  // PIN protection enabled
 
 // ============================================================
 // Hardware RNG — ESP32 True Random Number Generator
@@ -160,19 +171,25 @@ static void derive_address(const uint8_t pubkey[32], bool testnet, char *out, si
 // ============================================================
 
 quartz_wallet_err_t quartz_wallet_generate(bool testnet) {
-    // 1. Generate 32 bytes of true random for Ed25519 seed
-    quartz_rng(s_private_key, ED25519_PRIVATE_KEY_SIZE);
+    // 1. Generate 16 bytes of true random entropy (128-bit security)
+    uint8_t entropy[16];
+    quartz_rng(entropy, 16);
 
-    // 2. Derive Ed25519 public key from private seed
-    //    (Uses micro-ecc or esp_tinycrypt in production)
-    //    Placeholder: use mbedtls or link a compact Ed25519 impl
-    //    For now, we store the seed and derive pubkey via crypto library
-    quartz_ed25519_keypair(s_private_key, s_public_key);
+    // 2. Encode as BIP39 mnemonic (12 words with checksum)
+    //    Store words for the one-time seed display
+    quartz_entropy_to_mnemonic(entropy, s_mnemonic_words, sizeof(s_mnemonic_words[0]));
+    memset(entropy, 0, sizeof(entropy));  // wipe entropy after encoding
 
-    // 3. Derive Quartz address
+    // 3. Derive Ed25519 keypair from mnemonic via standard BIP39→BIP44
+    //    Same words → same key in any standard wallet (web, mobile, hardware)
+    quartz_bip39_derive_key((const char (*)[12])s_mnemonic_words,
+                            s_private_key, s_public_key);
+
+    // 4. Derive Quartz address from public key
     derive_address(s_public_key, testnet, s_address, sizeof(s_address));
+    s_is_testnet = testnet;
 
-    // 4. Persist to encrypted NVS
+    // 5. Persist to NVS
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
@@ -182,6 +199,7 @@ quartz_wallet_err_t quartz_wallet_generate(bool testnet) {
 
     nvs_set_blob(handle, NVS_KEY_PRIV, s_private_key, ED25519_PRIVATE_KEY_SIZE);
     nvs_set_blob(handle, NVS_KEY_PUB, s_public_key, ED25519_PUBLIC_KEY_SIZE);
+    nvs_set_blob(handle, NVS_KEY_MNEMONIC, s_mnemonic_words, sizeof(s_mnemonic_words));
 
     uint8_t flags = FLAG_MINING_ENABLED | (testnet ? FLAG_TESTNET : 0);
     nvs_set_u8(handle, NVS_KEY_FLAGS, flags);
@@ -191,11 +209,52 @@ quartz_wallet_err_t quartz_wallet_generate(bool testnet) {
 
     s_wallet_initialized = true;
 
-    ESP_LOGI(TAG, "Wallet generated on-device");
+    ESP_LOGI(TAG, "Wallet generated via BIP39→BIP44→Ed25519");
     ESP_LOGI(TAG, "Address: %s", s_address);
-    ESP_LOGI(TAG, "Private key NEVER exported — stored in encrypted flash");
+    ESP_LOGI(TAG, "Seed phrase is standard BIP39 — importable in any wallet");
 
     return QZ_WALLET_OK;
+}
+
+// ============================================================
+// Restore — Import Wallet from Seed Phrase (canonical BIP-39)
+// Same words = same key on phone / node / any device.
+// PIN (if set) is preserved across restore.
+// ============================================================
+
+quartz_wallet_err_t quartz_wallet_restore(const char words[12][12], bool testnet) {
+    if (!quartz_bip39_validate_words(words)) {
+        ESP_LOGE(TAG, "Restore: invalid words (not in list or bad checksum)");
+        return QZ_WALLET_ERR_INVALID;
+    }
+
+    quartz_bip39_derive_key(words, s_private_key, s_public_key);
+    derive_address(s_public_key, testnet, s_address, sizeof(s_address));
+    for (int i = 0; i < 12; i++) {
+        strncpy(s_mnemonic_words[i], words[i], 11);
+        s_mnemonic_words[i][11] = '\0';
+    }
+    s_is_testnet = testnet;
+    s_wallet_initialized = true;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return QZ_WALLET_ERR_STORAGE;
+
+    nvs_set_blob(handle, NVS_KEY_PRIV, s_private_key, ED25519_PRIVATE_KEY_SIZE);
+    nvs_set_blob(handle, NVS_KEY_PUB, s_public_key, ED25519_PUBLIC_KEY_SIZE);
+    nvs_set_blob(handle, NVS_KEY_MNEMONIC, s_mnemonic_words, sizeof(s_mnemonic_words));
+    uint8_t flags = FLAG_MINING_ENABLED | (testnet ? FLAG_TESTNET : 0);
+    nvs_set_u8(handle, NVS_KEY_FLAGS, flags);
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    ESP_LOGI(TAG, "Wallet restored from seed phrase: %s", s_address);
+    return QZ_WALLET_OK;
+}
+
+bool quartz_wallet_is_testnet(void) {
+    return s_is_testnet;
 }
 
 // ============================================================
@@ -224,12 +283,33 @@ quartz_wallet_err_t quartz_wallet_load(void) {
         return QZ_WALLET_ERR_CORRUPT;
     }
 
+    /* Restore failed-PIN counter so power-cycling can't reset it.
+     * (Brute-force fix: 10 wrong PINs = wipe, per LIFETIME, not per boot.) */
+    uint8_t stored_fails = 0;
+    if (nvs_get_u8(handle, NVS_KEY_PIN_FAIL, &stored_fails) == ESP_OK) {
+        s_pin_attempts = stored_fails;
+        if (s_pin_attempts > 0) {
+            ESP_LOGW(TAG, "PIN attempt counter restored: %d/%d",
+                     s_pin_attempts, PIN_MAX_ATTEMPTS);
+        }
+    }
+
+    /* Restore mnemonic words (for PIN-gated 'seed' re-show command) */
+    size_t mnem_size = sizeof(s_mnemonic_words);
+    if (nvs_get_blob(handle, NVS_KEY_MNEMONIC, s_mnemonic_words, &mnem_size) != ESP_OK) {
+        /* Pre-BIP39 wallet: no stored mnemonic. Device can still mine/sign
+         * but 'seed' command won't work. Re-generate wallet to get BIP39. */
+        memset(s_mnemonic_words, 0, sizeof(s_mnemonic_words));
+        ESP_LOGW(TAG, "No mnemonic in NVS (pre-BIP39 wallet) — seed re-show unavailable");
+    }
+
     uint8_t flags = 0;
     nvs_get_u8(handle, NVS_KEY_FLAGS, &flags);
     nvs_close(handle);
 
     bool testnet = flags & FLAG_TESTNET;
     derive_address(s_public_key, testnet, s_address, sizeof(s_address));
+    s_is_testnet = testnet;
     s_wallet_initialized = true;
 
     ESP_LOGI(TAG, "Wallet loaded from NVS: %s", s_address);
@@ -292,11 +372,19 @@ quartz_wallet_err_t quartz_wallet_get_seed_phrase_for_backup(
 ) {
     if (!s_wallet_initialized) return QZ_WALLET_ERR_NOT_FOUND;
 
-    // Convert private key bytes to BIP39 mnemonic
-    // (uses the official BIP39 wordlist + checksum)
-    quartz_privkey_to_mnemonic(s_private_key, words, max_word_len);
+    // Return the stored BIP39 mnemonic (generated at wallet creation time)
+    // This is the SAME 12 words that any standard wallet would derive from.
+    if (s_mnemonic_words[0][0] == '\0') {
+        ESP_LOGE(TAG, "No mnemonic stored (pre-BIP39 wallet) — re-generate wallet");
+        return QZ_WALLET_ERR_NOT_FOUND;
+    }
 
-    ESP_LOGW(TAG, "Seed phrase generated for ONE-TIME backup display");
+    for (int i = 0; i < 12; i++) {
+        strncpy(words[i], s_mnemonic_words[i], max_word_len - 1);
+        words[i][max_word_len - 1] = '\0';
+    }
+
+    ESP_LOGW(TAG, "Seed phrase displayed for backup (BIP39 standard)");
     ESP_LOGW(TAG, "After user confirms backup, mnemonic MUST be wiped from RAM");
 
     return QZ_WALLET_OK;
@@ -306,6 +394,41 @@ void quartz_wallet_wipe_seed_phrase(char words[12][12]) {
     // Securely zero the mnemonic buffer
     memset(words, 0, 12 * 12);
     ESP_LOGI(TAG, "Seed phrase wiped from RAM");
+}
+
+// ============================================================
+// Backup Confirmation (persistent NVS flag)
+// ============================================================
+
+quartz_wallet_err_t quartz_wallet_confirm_backup(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return QZ_WALLET_ERR_STORAGE;
+    }
+
+    // Read current flags, set FLAG_BACKED_UP
+    uint8_t flags = 0;
+    nvs_get_u8(handle, NVS_KEY_FLAGS, &flags);
+    flags |= FLAG_BACKED_UP;
+    nvs_set_u8(handle, NVS_KEY_FLAGS, flags);
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    ESP_LOGI(TAG, "✅ Backup confirmed — FLAG_BACKED_UP set in NVS");
+    return QZ_WALLET_OK;
+}
+
+bool quartz_wallet_is_backup_confirmed(void) {
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    uint8_t flags = 0;
+    nvs_get_u8(handle, NVS_KEY_FLAGS, &flags);
+    nvs_close(handle);
+    return (flags & FLAG_BACKED_UP) != 0;
 }
 
 // ============================================================
@@ -319,6 +442,9 @@ quartz_wallet_err_t quartz_wallet_wipe(void) {
         nvs_erase_key(handle, NVS_KEY_PRIV);
         nvs_erase_key(handle, NVS_KEY_PUB);
         nvs_erase_key(handle, NVS_KEY_FLAGS);
+        nvs_erase_key(handle, NVS_KEY_PIN_HASH);
+        nvs_erase_key(handle, NVS_KEY_PIN_SALT);
+        nvs_erase_key(handle, NVS_KEY_PIN_FAIL);
         nvs_commit(handle);
         nvs_close(handle);
     }
@@ -328,9 +454,180 @@ quartz_wallet_err_t quartz_wallet_wipe(void) {
     memset(s_public_key, 0, sizeof(s_public_key));
     memset(s_address, 0, sizeof(s_address));
     s_wallet_initialized = false;
+    s_pin_attempts = 0;
 
     ESP_LOGI(TAG, "Wallet wiped — device reset to factory");
     return QZ_WALLET_OK;
+}
+
+// ============================================================
+// PIN Protection
+// ============================================================
+
+quartz_wallet_err_t quartz_wallet_set_pin(const char *pin) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return QZ_WALLET_ERR_STORAGE;
+    }
+
+    // Read current flags
+    uint8_t flags = 0;
+    nvs_get_u8(handle, NVS_KEY_FLAGS, &flags);
+
+    if (pin == NULL || pin[0] == '\0') {
+        // Empty PIN = remove PIN protection
+        nvs_erase_key(handle, NVS_KEY_PIN_HASH);
+        nvs_erase_key(handle, NVS_KEY_PIN_SALT);
+        flags &= ~FLAG_HAS_PIN;
+        nvs_set_u8(handle, NVS_KEY_FLAGS, flags);
+        nvs_set_u8(handle, NVS_KEY_PIN_FAIL, 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+        s_pin_attempts = 0;
+        ESP_LOGI(TAG, "PIN protection removed");
+        return QZ_WALLET_OK;
+    }
+
+    // Validate: digits only, 4-8 chars
+    size_t len = strlen(pin);
+    if (len < 4 || len > 8) {
+        nvs_close(handle);
+        ESP_LOGE(TAG, "PIN must be 4-8 digits");
+        return QZ_WALLET_ERR_INVALID;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (pin[i] < '0' || pin[i] > '9') {
+            nvs_close(handle);
+            return QZ_WALLET_ERR_INVALID;
+        }
+    }
+
+    // Generate random salt
+    uint8_t salt[16];
+    quartz_rng(salt, 16);
+
+    // Hash: SHA-256(salt || pin)
+    uint8_t pin_hash[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, salt, 16);
+    mbedtls_sha256_update(&ctx, (const uint8_t *)pin, len);
+    mbedtls_sha256_finish(&ctx, pin_hash);
+    mbedtls_sha256_free(&ctx);
+
+    // Store
+    nvs_set_blob(handle, NVS_KEY_PIN_HASH, pin_hash, 32);
+    nvs_set_blob(handle, NVS_KEY_PIN_SALT, salt, 16);
+    flags |= FLAG_HAS_PIN;
+    nvs_set_u8(handle, NVS_KEY_FLAGS, flags);
+    nvs_set_u8(handle, NVS_KEY_PIN_FAIL, 0);
+    nvs_commit(handle);
+    nvs_close(handle);
+
+    s_pin_attempts = 0;
+    ESP_LOGI(TAG, "PIN set (%d digits)", (int)len);
+    return QZ_WALLET_OK;
+}
+
+quartz_wallet_err_t quartz_wallet_check_pin(const char *pin) {
+    if (!quartz_wallet_has_pin()) {
+        return QZ_WALLET_OK;  // No PIN set = always pass
+    }
+    if (pin == NULL || pin[0] == '\0') {
+        return QZ_WALLET_ERR_AUTH;
+    }
+
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return QZ_WALLET_ERR_STORAGE;
+    }
+
+    // Load salt and hash
+    uint8_t salt[16];
+    uint8_t stored_hash[32];
+    size_t required = 16;
+    if (nvs_get_blob(handle, NVS_KEY_PIN_SALT, salt, &required) != ESP_OK ||
+        required != 16) {
+        nvs_close(handle);
+        return QZ_WALLET_ERR_CORRUPT;
+    }
+    required = 32;
+    if (nvs_get_blob(handle, NVS_KEY_PIN_HASH, stored_hash, &required) != ESP_OK ||
+        required != 32) {
+        nvs_close(handle);
+        return QZ_WALLET_ERR_CORRUPT;
+    }
+    nvs_close(handle);
+
+    // Compute hash of provided PIN
+    uint8_t test_hash[32];
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, salt, 16);
+    mbedtls_sha256_update(&ctx, (const uint8_t *)pin, strlen(pin));
+    mbedtls_sha256_finish(&ctx, test_hash);
+    mbedtls_sha256_free(&ctx);
+
+    // Constant-time comparison
+    uint8_t diff = 0;
+    for (int i = 0; i < 32; i++) {
+        diff |= stored_hash[i] ^ test_hash[i];
+    }
+
+    // Clear sensitive data
+    memset(test_hash, 0, 32);
+
+    return (diff == 0) ? QZ_WALLET_OK : QZ_WALLET_ERR_AUTH;
+}
+
+bool quartz_wallet_has_pin(void) {
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+    uint8_t flags = 0;
+    nvs_get_u8(handle, NVS_KEY_FLAGS, &flags);
+    nvs_close(handle);
+    return (flags & FLAG_HAS_PIN) != 0;
+}
+
+uint8_t quartz_wallet_pin_attempts(void) {
+    return s_pin_attempts;
+}
+
+void quartz_wallet_reset_pin_attempts(void) {
+    s_pin_attempts = 0;
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, NVS_KEY_PIN_FAIL, 0);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+}
+
+bool quartz_wallet_record_failed_pin(void) {
+    s_pin_attempts++;
+
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u8(handle, NVS_KEY_PIN_FAIL, s_pin_attempts);
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+
+    ESP_LOGW(TAG, "Failed PIN attempt %d/%d", s_pin_attempts, PIN_MAX_ATTEMPTS);
+
+    if (s_pin_attempts >= PIN_MAX_ATTEMPTS) {
+        ESP_LOGE(TAG, "🚨 MAX PIN ATTEMPTS REACHED — WIPING DEVICE");
+        quartz_wallet_wipe();
+        return true;
+    }
+
+    return false;
 }
 
 // ============================================================

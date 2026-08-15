@@ -56,6 +56,17 @@ int quartz_qr_display(
  */
 int quartz_qr_version_for_data(int data_len, qr_ecc_t ecc);
 
+/**
+ * Output a QR code as ASCII art on the serial terminal.
+ * Uses Unicode block characters for compact display.
+ * The phone app can scan this directly from the terminal screen.
+ *
+ * @param data      String to encode
+ * @param ecc       Error correction level
+ * @return 0 on success, -1 on error
+ */
+int quartz_qr_serial(const char *data, qr_ecc_t ecc);
+
 #ifdef __cplusplus
 }
 #endif

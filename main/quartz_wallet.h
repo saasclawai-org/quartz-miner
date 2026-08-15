@@ -24,6 +24,7 @@ typedef enum {
     QZ_WALLET_ERR_CORRUPT    = -3,  // data integrity check failed
     QZ_WALLET_ERR_AUTH       = -4,  // BLE connection not authenticated
     QZ_WALLET_ERR_LOCKED     = -5,  // wallet locked, needs unlock
+    QZ_WALLET_ERR_INVALID    = -6,  // invalid input
 } quartz_wallet_err_t;
 
 /**
@@ -85,10 +86,67 @@ quartz_wallet_err_t quartz_wallet_get_seed_phrase_for_backup(
 void quartz_wallet_wipe_seed_phrase(char words[12][12]);
 
 /**
+ * Mark seed phrase backup as confirmed.
+ * Sets FLAG_BACKED_UP in NVS — device won't nag about seed on boot.
+ * Call after user confirms they wrote down the words.
+ */
+quartz_wallet_err_t quartz_wallet_confirm_backup(void);
+
+/**
+ * Check if seed phrase backup has been confirmed.
+ * Returns true if FLAG_BACKED_UP is set in NVS.
+ */
+bool quartz_wallet_is_backup_confirmed(void);
+
+/**
  * Factory reset — wipe all keys from NVS and RAM.
  * Requires physical button hold to trigger via BLE.
  */
 quartz_wallet_err_t quartz_wallet_wipe(void);
+
+// ============================================================
+// PIN Protection
+// ============================================================
+
+/**
+ * Set a PIN (4-8 digits). Hashed with salt before storing in NVS.
+ * Empty PIN string removes PIN protection.
+ *
+ * @param pin    Null-terminated PIN string (digits only)
+ * @return QZ_WALLET_OK on success
+ */
+quartz_wallet_err_t quartz_wallet_set_pin(const char *pin);
+
+/**
+ * Verify a PIN against stored hash.
+ *
+ * @param pin    Null-terminated PIN string
+ * @return QZ_WALLET_OK if correct, QZ_WALLET_ERR_AUTH if wrong
+ */
+quartz_wallet_err_t quartz_wallet_check_pin(const char *pin);
+
+/**
+ * Check if a PIN is set.
+ */
+bool quartz_wallet_has_pin(void);
+
+/**
+ * Get number of failed PIN attempts since last success.
+ */
+uint8_t quartz_wallet_pin_attempts(void);
+
+/**
+ * Reset failed attempt counter (called on successful PIN entry).
+ */
+void quartz_wallet_reset_pin_attempts(void);
+
+/**
+ * Increment failed attempt counter. If counter reaches 10,
+ * triggers factory wipe (calls quartz_wallet_wipe()).
+ *
+ * @return true if device was wiped (10 attempts reached)
+ */
+bool quartz_wallet_record_failed_pin(void);
 
 // --- Ed25519 crypto functions (implemented by linked crypto lib) ---
 
@@ -106,9 +164,34 @@ void quartz_ed25519_sign(const uint8_t privkey[32],
                           uint8_t signature[64]);
 
 /**
- * Convert private key bytes to BIP39 mnemonic words.
+ * Convert 16 bytes of entropy to BIP39 mnemonic words.
  * Uses official 2048-word English wordlist with SHA-256 checksum.
  */
+void quartz_entropy_to_mnemonic(const uint8_t entropy[16],
+                                 char words[12][12],
+                                 size_t max_word_len);
+
+/**
+ * Derive Ed25519 keypair from BIP39 mnemonic words.
+ * Pipeline: words → PBKDF2 → SLIP-0010 m/44'/789'/0'/0'/0' → Ed25519.
+ * Same words produce the same key in any standard wallet.
+ */
+void quartz_bip39_derive_key(const char words[12][12],
+                              uint8_t privkey[32],
+                              uint8_t pubkey[32]);
+
+/** Validate 12-word mnemonic (wordlist + BIP-39 checksum). */
+bool quartz_bip39_validate_words(const char words[12][12]);
+
+/** Import a wallet from 12 words (canonical derivation). Checksum-validated.
+ *  Replaces any existing wallet. PIN (if set) is preserved. */
+quartz_wallet_err_t quartz_wallet_restore(const char words[12][12], bool testnet);
+
+/** True if current wallet is a testnet wallet. */
+bool quartz_wallet_is_testnet(void);
+
+/* Deprecated: old one-way privkey→mnemonic encoding. */
+/* Kept for reference but not used by new wallet generation. */
 void quartz_privkey_to_mnemonic(const uint8_t privkey[32],
                                  char words[12][12],
                                  size_t max_word_len);
