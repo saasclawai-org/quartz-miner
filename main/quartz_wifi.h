@@ -57,6 +57,7 @@ extern qz_mining_state_t g_mining_state;
  * If not → start captive portal for provisioning.
  */
 void quartz_wifi_init(void);
+void quartz_wifi_set_full_power(void);
 
 /**
  * Check if WiFi is connected.

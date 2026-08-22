@@ -18,6 +18,7 @@
 #include "quartz_pay.h"
 #include "quartz_agent.h"
 #include "quartz_ble.h"
+#include "quartz_mesh.h"
 #include "quartz_qr.h"
 #include <string.h>
 #include <stdio.h>
@@ -59,6 +60,18 @@ uint32_t g_last_hps = 0;  /* current hashrate, read by mining_submit */
 #define QUARTZ_NODE_HOST "167.233.19.85"
 #define QUARTZ_NODE_PORT 21100
 
+/* === Buttons ===
+ * ESP32 (M5Stack Core): 3 buttons A/B/C on GPIO 39/38/37.
+ * ESP32-S3 (Heltec V3): 1 USER button on GPIO0 — cycles screens.
+ */
+/* PIN entry state — shared by display paths on all boards */
+static char s_pin_display[9] = {0};
+static int s_pin_len = 0;
+static int s_pin_digit = 0;
+static float s_payment_amount = 0.1f;  /* default QR amount */
+
+#ifdef CONFIG_IDF_TARGET_ESP32
+
 /* === M5Stack Core Buttons === */
 #define BTN_A_PIN   39   /* Left button (SENSOR_VN) */
 #define BTN_B_PIN   38   /* Middle button */
@@ -68,12 +81,6 @@ uint32_t g_last_hps = 0;  /* current hashrate, read by mining_submit */
 static bool btn_a_pressed = false;
 static bool btn_b_pressed = false;
 static bool btn_c_pressed = false;
-static float s_payment_amount = 0.1f;  /* default QR amount */
-
-/* PIN entry state (M5Stack 3-button input) */
-static char s_pin_display[9] = {0};
-static int s_pin_len = 0;
-static int s_pin_digit = 0;
 static uint32_t btn_last_read_sec = 0;
 static uint32_t btn_debounce_count = 0;
 static int64_t btn_a_low_since_us = 0;  /* timestamp when A first read low */
@@ -235,6 +242,71 @@ static void poll_buttons(void) {
         return;
     }
 }
+
+#else /* CONFIG_IDF_TARGET_ESP32S3 — Heltec V3 USER button */
+
+#define S3_BTN_PIN             0    /* USER / BOOT button */
+#define S3_BTN_DEBOUNCE_US     300000
+#define S3_BTN_COOLDOWN_SEC     1
+#define S3_BTN_STARTUP_GRACE    10
+
+static int64_t s3_btn_low_since_us = 0;
+static bool s3_btn_latched = false;
+static uint32_t s3_btn_last_sec = 0;
+
+static void init_buttons(void) {
+    gpio_config_t conf = {
+        .pin_bit_mask = 1ULL << S3_BTN_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&conf);
+}
+
+/* USER button: cycle ID → MINING → FLEET → PAYMENT → ID.
+ * Long-press (>1.5s) on PAYMENT bumps the QR amount. */
+static void poll_buttons(void) {
+    uint32_t now = esp_timer_get_time() / 1000000;
+    if (now < S3_BTN_STARTUP_GRACE) return;
+    if (s3_btn_last_sec && (now - s3_btn_last_sec) < S3_BTN_COOLDOWN_SEC) return;
+
+    int64_t now_us = esp_timer_get_time();
+    bool raw = (gpio_get_level(S3_BTN_PIN) == 0);
+
+    if (raw) {
+        if (s3_btn_low_since_us == 0) s3_btn_low_since_us = now_us;
+        if (!s3_btn_latched && (now_us - s3_btn_low_since_us) >= S3_BTN_DEBOUNCE_US) {
+            s3_btn_latched = true;
+            s3_btn_last_sec = now;
+
+            qz_screen_t cur = quartz_display_get_screen();
+            switch (cur) {
+            case QZ_SCREEN_ID:
+                quartz_display_set_screen(QZ_SCREEN_MINING);
+                break;
+            case QZ_SCREEN_MINING:
+                quartz_display_set_screen(QZ_SCREEN_FLEET);
+                break;
+            case QZ_SCREEN_FLEET:
+                quartz_display_set_screen(QZ_SCREEN_PAYMENT);
+                quartz_display_qr_payment(quartz_wallet_get_address(),
+                                          s_payment_amount);
+                break;
+            case QZ_SCREEN_PAYMENT:
+            default:
+                quartz_display_set_screen(QZ_SCREEN_ID);
+                break;
+            }
+        }
+    } else {
+        s3_btn_low_since_us = 0;
+        s3_btn_latched = false;
+    }
+}
+
+#endif /* target buttons */
 
 /* === Persistent serial commands (available while mining) ===
  * Post-setup the old first-boot command loop never ran — 'setpin' was
@@ -487,7 +559,8 @@ static void init_nvs(void) {
 static void mining_task(void *pvParameters) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  Quartz (QZ) — ESP32 Cryptocurrency Miner");
-    ESP_LOGI(TAG, "  Version: %d", QUARTZ_VERSION);
+    ESP_LOGI(TAG, "  Firmware: %s", FW_VERSION_STRING);
+    ESP_LOGI(TAG, "  Protocol: %d", QUARTZ_VERSION);
     ESP_LOGI(TAG, "  Target: ESP32-S3 (generic)");
     ESP_LOGI(TAG, "  Node: %s:%d", QUARTZ_NODE_HOST, QUARTZ_NODE_PORT);
     ESP_LOGI(TAG, "========================================");
@@ -631,6 +704,7 @@ static void mining_task(void *pvParameters) {
             quartz_ble_set_seed_phrase((const char (*)[12])words);
 
             ESP_LOGI(TAG, "Waiting for confirmation...");
+            ESP_LOGI(TAG, "  - HOLD BOOT/PRG BUTTON 3s (no PC needed)");
             ESP_LOGI(TAG, "  - Quartz app (BLE): pair device, then confirm in app");
             ESP_LOGI(TAG, "  - Serial: type 'confirm' + Enter");
 
@@ -638,6 +712,17 @@ static void mining_task(void *pvParameters) {
             char serial_buf[32] = {0};
             int serial_pos = 0;
             bool serial_confirmed = false;
+
+            /* BOOT/PRG button (GPIO0, active-low) — hold 3s to confirm.
+             * GPIO0 = PRG button on LilyGO T3; harmless on M5Stack (speaker SD).
+             * Same rationale as v069-c3: host serial tx is often wedged. */
+            gpio_config_t boot_btn = {
+                .pin_bit_mask = 1ULL << 0,
+                .mode = GPIO_MODE_INPUT,
+                .pull_up_en = GPIO_PULLUP_ENABLE,
+            };
+            gpio_config(&boot_btn);
+            int boot_hold_ms = 0;
 
             /* Wait for confirmation from ANY source — NO TIMEOUT */
             while (!quartz_ble_is_seed_confirmed() &&
@@ -680,8 +765,20 @@ static void mining_task(void *pvParameters) {
                             ESP_LOGI(TAG, "Recovery mode — parsing seed phrase...");
                             /* TODO: parse 12 words, derive address, query node */
                             ESP_LOGI(TAG, "Recovery not yet fully implemented — use app");
+                        } else if (strcasecmp(serial_buf, "wifi") == 0) {
+                            /* Wipe WiFi credentials and reboot into provisioning portal */
+                            nvs_handle_t h;
+                            if (nvs_open("qz_wifi", NVS_READWRITE, &h) == ESP_OK) {
+                                nvs_erase_key(h, "ssid");
+                                nvs_erase_key(h, "pass");
+                                nvs_commit(h);
+                                nvs_close(h);
+                            }
+                            ESP_LOGI(TAG, "WiFi cleared — rebooting into portal (Quartz-XXXX AP)");
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                            esp_restart();
                         } else if (strcasecmp(serial_buf, "help") == 0) {
-                            ESP_LOGI(TAG, "Commands: confirm | pin <digits> | setpin <digits> | pinstatus | recover <12 words> | help");
+                            ESP_LOGI(TAG, "Commands: confirm | pin <digits> | setpin <digits> | pinstatus | recover <12 words> | wifi | help");
                         }
                         serial_pos = 0;
                         serial_buf[0] = '\0';
@@ -697,6 +794,21 @@ static void mining_task(void *pvParameters) {
                         serial_buf[serial_pos++] = ch;
                     }
                 }
+
+                /* BOOT/PRG button hold-to-confirm */
+                if (gpio_get_level(0) == 0) {
+                    boot_hold_ms += 50;
+                    if (boot_hold_ms == 1000) {
+                        ESP_LOGI(TAG, "BOOT held 1s... keep holding to confirm (3s)");
+                    }
+                    if (boot_hold_ms >= 3000) {
+                        serial_confirmed = true;
+                        ESP_LOGI(TAG, "✅ Seed confirmed via BOOT button");
+                    }
+                } else {
+                    boot_hold_ms = 0;
+                }
+
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
 
@@ -765,10 +877,18 @@ static void mining_task(void *pvParameters) {
     g_scratchpad_size = scratchpad_size;
     ESP_LOGI(TAG, "Scratchpad allocated (%d KB)", scratchpad_size / 1024);
 
-    /* Initialize BLE GATT server for phone app (after scratchpad) */
-    quartz_ble_set_address(quartz_wallet_get_address());
-    quartz_ble_init();
-    ESP_LOGI(TAG, "BLE ready — pair as \"Quartz-Miner\"");
+    /* BLE only while seed provisioning might still be needed (v070).
+     * Once backup is confirmed, dedicate the radio to WiFi and kill
+     * modem-sleep coex churn (router evictions). */
+    bool ble_on = !quartz_wallet_is_backup_confirmed();
+    if (ble_on) {
+        quartz_ble_set_address(quartz_wallet_get_address());
+        quartz_ble_init();
+        ESP_LOGI(TAG, "BLE ready — pair as \"Quartz-Miner\"");
+    } else {
+        ESP_LOGI(TAG, "BLE off (seed confirmed) — radio dedicated to WiFi");
+        quartz_wifi_set_full_power();
+    }
 
     /* If PIN is set, show PIN entry screen before mining starts */
     if (quartz_wallet_has_pin()) {
@@ -812,6 +932,18 @@ static void mining_task(void *pvParameters) {
     bool have_work = false;
     uint32_t last_work_fetch = 0;
 
+    /* v071: offline block stash — found block awaiting submission.
+     * Kept in RAM, retried every 5s once online, dropped if the chain
+     * advances past its height (orphaned). No more thrown-away blocks. */
+    static struct {
+        bool     valid;
+        char     job_id[32];
+        uint64_t nonce;
+        uint8_t  header[80];
+        uint32_t height;
+        uint32_t last_try;
+    } pend = {0};
+
     while (s_mining) {
         quartz_serial_poll();
         /* Fetch new work every 30 seconds or on first iteration */
@@ -825,10 +957,42 @@ static void mining_task(void *pvParameters) {
                 last_work_fetch = now;
                 ESP_LOGI(TAG, "📡 Got work: block %d, target %d",
                          tmpl.height, tmpl.target_bits);
+                /* Share work with mesh peers */
+                quartz_mesh_share_work(&tmpl);
             } else {
                 /* Fallback to local mining if node unreachable */
                 if (!have_work) {
                     ESP_LOGW(TAG, "Node unreachable, mining locally");
+                }
+            }
+        }
+
+        /* If no WiFi, try to get work from mesh peers */
+        if (!have_work && quartz_mesh_is_active()) {
+            if (quartz_mesh_get_work(&tmpl) == 0) {
+                memcpy(header, tmpl.header, 80);
+                nonce = 0;
+                have_work = true;
+                last_work_fetch = now;
+                ESP_LOGI(TAG, "📡 Got work via mesh: block %d, target %d",
+                         tmpl.height, tmpl.target_bits);
+            }
+        }
+
+        /* v071: retry stashed block once the link is back */
+        if (pend.valid) {
+            if (have_work && tmpl.height > pend.height) {
+                ESP_LOGW(TAG, "Stashed block #%u orphaned (chain at %u) - dropped",
+                         pend.height, tmpl.height);
+                pend.valid = false;
+            } else if (quartz_wifi_is_connected() && (now - pend.last_try) >= 5) {
+                pend.last_try = now;
+                int rc = quartz_mining_submit(pend.job_id, pend.nonce, pend.header);
+                if (rc == 0) {
+                    ESP_LOGI(TAG, "Stashed block #%u ACCEPTED after retry (+42 QZ)", pend.height);
+                    pend.valid = false;
+                } else {
+                    ESP_LOGW(TAG, "Stash retry failed (%d), trying again in 5s", rc);
                 }
             }
         }
@@ -864,14 +1028,32 @@ static void mining_task(void *pvParameters) {
                     ESP_LOGI(TAG, "PUF attestation: %02x%02x%02x%02x...",
                              puf_resp[0], puf_resp[1], puf_resp[2], puf_resp[3]);
 
-                    /* Submit to node */
+                    /* Share block find with mesh peers */
+                    quartz_mesh_share_found(header, nonce);
+
+                    /* Submit to node (v071: stash for retry if offline or submit fails) */
                     if (quartz_wifi_is_connected()) {
                         int rc = quartz_mining_submit(tmpl.job_id, nonce, header);
                         if (rc == 0) {
                             ESP_LOGI(TAG, "Block submitted and accepted!");
                         } else {
-                            ESP_LOGW(TAG, "Block submit failed (%d)", rc);
+                            ESP_LOGW(TAG, "Submit failed (%d) - stashing block #%u", rc, tmpl.height);
+                            pend.valid = true;
+                            strlcpy(pend.job_id, tmpl.job_id, sizeof(pend.job_id));
+                            pend.nonce = nonce;
+                            memcpy(pend.header, header, 80);
+                            pend.height = tmpl.height;
+                            pend.last_try = now;
                         }
+                    } else {
+                        ESP_LOGW(TAG, "OFFLINE - stashing block #%u (+42 QZ) until link returns",
+                                 tmpl.height);
+                        pend.valid = true;
+                        strlcpy(pend.job_id, tmpl.job_id, sizeof(pend.job_id));
+                        pend.nonce = nonce;
+                        memcpy(pend.header, header, 80);
+                        pend.height = tmpl.height;
+                        pend.last_try = now;
                     }
 
                     /* Fetch new work immediately */
@@ -890,8 +1072,8 @@ static void mining_task(void *pvParameters) {
             static uint32_t s_last_log_uptime = 0;
             if (uptime - s_last_log_uptime >= 60) {
                 s_last_log_uptime = uptime;
-                ESP_LOGI(TAG, "Mining... %lu H/s, %lu total, uptime %luh%lum",
-                         hps, s_hash_count, uptime / 3600, (uptime % 3600) / 60);
+                ESP_LOGI(TAG, "Mining... %lu H/s, %lu total, uptime %luh%lum [%s]",
+                         hps, s_hash_count, uptime / 3600, (uptime % 3600) / 60, FW_VERSION_STRING);
             }
 
 #ifdef QUARTZ_HAS_DISPLAY
@@ -920,6 +1102,24 @@ static void mining_task(void *pvParameters) {
 
             /* Update BLE stats for phone app */
             quartz_ble_update_stats(s_hash_count, hps, s_blocks_found, uptime);
+
+            /* Check for mesh-found blocks from peers — relay to node */
+            if (quartz_wifi_is_connected()) {
+                uint8_t m_header[80];
+                uint64_t m_nonce;
+                if (quartz_mesh_get_found(m_header, &m_nonce) == 0) {
+                    ESP_LOGI(TAG, "📡 Relaying mesh peer's block to node (nonce %llu)", m_nonce);
+                    int rc = quartz_mining_submit("mesh", m_nonce, m_header);
+                    if (rc == 0) {
+                        ESP_LOGI(TAG, "✅ Mesh block relayed successfully!");
+                    } else {
+                        ESP_LOGW(TAG, "Mesh block relay failed (%d)", rc);
+                    }
+                }
+            }
+
+            /* Mesh maintenance */
+            quartz_mesh_step(uptime);
 
             /* Poll for messages every 10 seconds */
             static uint32_t last_msg_check = 0;
@@ -968,7 +1168,7 @@ static void mining_task(void *pvParameters) {
 /* === Main Entry Point === */
 #ifdef ESP_PLATFORM
 void app_main(void) {
-    ESP_LOGI(TAG, "Quartz ESP32 Miner starting...");
+    ESP_LOGI(TAG, "Quartz ESP32 Miner %s starting...", FW_VERSION_STRING);
 
     /* Initialize NVS */
     init_nvs();
@@ -1012,6 +1212,16 @@ void app_main(void) {
         quartz_display_connecting();
 #endif
         quartz_wifi_wait_connected(15000);
+    }
+
+    /* Initialize ESP-NOW mesh (after WiFi is up) */
+    if (quartz_wifi_is_connected()) {
+        quartz_mesh_init();
+        quartz_mesh_update_caps(QZ_CAP_HAS_WIFI | QZ_CAP_IS_MINING);
+    } else {
+        /* Still init mesh — we can receive work from peers without WiFi */
+        quartz_mesh_init();
+        quartz_mesh_update_caps(QZ_CAP_IS_MINING);
     }
 
     /* Start mining task on Core 1 (Core 0 handles WiFi/BLE/display) */
