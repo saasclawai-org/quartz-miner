@@ -38,6 +38,7 @@ extern "C" {
 #define QZ_MESH_FOUND      0x03   /* Block found: header + nonce — relay to connected peer */
 #define QZ_MESH_PEER_LIST   0x04   /* Peer list sync */
 #define QZ_MESH_ACK         0x05   /* Acknowledgement */
+#define QZ_MESH_WORK_REQ    0x06   /* v076: headless board requests work paying ITS wallet address */
 
 /* Capabilities flags (in HELLO) */
 #define QZ_CAP_HAS_WIFI    0x01   /* This board has WiFi connection to node */
@@ -79,6 +80,16 @@ typedef struct {
     uint32_t height;       /* Current block height */
 } __attribute__((packed)) qz_mesh_hello_t;
 
+/* Work request packet (1 + 6 + 40 = 47 bytes) — v076 per-board payouts:
+ * a headless (or node-unreachable) board asks for work paying ITS wallet;
+ * a connected peer fetches a template for that address and replies with a
+ * directed QZ_MESH_WORK packet. Found-block relay is unchanged. */
+typedef struct {
+    uint8_t  type;          /* QZ_MESH_WORK_REQ */
+    uint8_t  mac[6];        /* Requester MAC (for the directed reply) */
+    char     address[40];   /* Requester's payout address */
+} __attribute__((packed)) qz_mesh_work_req_t;
+
 /* ============================================================
  * API
  * ============================================================ */
@@ -110,6 +121,25 @@ void quartz_mesh_share_found(const uint8_t header[80], uint64_t nonce);
 int quartz_mesh_get_work(qz_block_template_t *tmpl);
 
 /**
+ * v076: Broadcast a work request carrying OUR wallet address.
+ * A connected peer fetches a template paying that address and replies
+ * with a directed QZ_MESH_WORK packet.
+ */
+void quartz_mesh_request_work(const char *address);
+
+/**
+ * v076: Poll for a pending work request from a peer. Returns 0 and fills
+ * address/mac if pending, -1 otherwise. Caller should fetch a template
+ * paying that address and send it via quartz_mesh_send_work_to().
+ */
+int quartz_mesh_get_work_req(char address[40], uint8_t mac[6]);
+
+/**
+ * v076: Send a work template to a specific peer (directed, not broadcast).
+ */
+void quartz_mesh_send_work_to(const uint8_t mac[6], const qz_block_template_t *tmpl);
+
+/**
  * Check if we received a found block from a mesh peer.
  * Returns 0 and fills header/nonce if available, -1 otherwise.
  * The caller should submit this to the node on behalf of the peer.
@@ -120,6 +150,11 @@ int quartz_mesh_get_found(uint8_t header[80], uint64_t *nonce);
  * Update our capabilities (re-broadcast HELLO with new caps).
  */
 void quartz_mesh_update_caps(uint8_t caps);
+
+/**
+ * Update our chain height (announced in HELLO beacons).
+ */
+void quartz_mesh_update_height(uint32_t height);
 
 /**
  * Get peer list for display/stats.

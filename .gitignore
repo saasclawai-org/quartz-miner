@@ -6,3 +6,4 @@ sdkconfig.old
 secure_boot_signing_key.pem
 secure_boot_signing_key.pem.signed
 build-s3/
+*.bak

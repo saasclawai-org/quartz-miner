@@ -36,7 +36,7 @@ static const int qr_byte_capacity[4][10] = {
 };
 
 /* Modules per side for each version (version N = 4N+17) */
-static int qr_modules(int version) {
+int qr_modules(int version) {
     return 4 * version + 17;
 }
 

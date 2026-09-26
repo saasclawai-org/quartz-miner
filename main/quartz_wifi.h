@@ -15,6 +15,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Quartz node this miner talks to. Override with
+ * -DNODE_HOST=\"192.168.1.50\" (e.g. your own Raspberry Pi gateway)
+ * or edit the default here and rebuild. */
+#ifndef NODE_HOST
+#define NODE_HOST   "quartzchain.net"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +56,11 @@ typedef struct {
 extern qz_wifi_state_t g_wifi_state;
 extern qz_mining_state_t g_mining_state;
 
+/* Runtime node endpoint (captive-portal configurable, NVS-backed;
+ * falls back to the NODE_HOST/NODE_PORT compile-time defaults) */
+const char *quartz_wifi_node_host(void);
+int         quartz_wifi_node_port(void);
+
 /* === Lifecycle === */
 
 /**
@@ -58,6 +70,9 @@ extern qz_mining_state_t g_mining_state;
  */
 void quartz_wifi_init(void);
 void quartz_wifi_set_full_power(void);
+void quartz_wifi_set_coex_power(void);   /* v083: MIN_MODEM — BLE pair window */
+void quartz_wifi_set_credentials(const char *ssid, const char *pass);  /* v089.9: BLE provisioning */
+bool quartz_wifi_has_creds(void);        /* v089.10: setup-incomplete gate for BLE */
 
 /**
  * Check if WiFi is connected.
@@ -81,6 +96,7 @@ const char *quartz_wifi_get_ip(void);
  * Returns QZ_OK on success, template filled in.
  */
 int quartz_mining_get_work(qz_block_template_t *tmpl);
+int quartz_mining_get_work_for(const char *address, qz_block_template_t *tmpl);
 
 /**
  * Submit a found block (nonce that meets target).

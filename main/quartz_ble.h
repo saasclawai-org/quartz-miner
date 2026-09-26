@@ -19,8 +19,17 @@
 #define QUARTZ_CHAR_PIN_UNLOCK_UUID 0x0A07  /* Write: unlock device with PIN */
 #define QUARTZ_CHAR_PIN_STATUS_UUID 0x0A08  /* Read: has PIN? attempts left? */
 
+/* Relay characteristics (v089.12 — docs/RELAY-BLE-SPEC.md) */
+#define QUARTZ_CHAR_RELAY_STATUS_UUID 0x0A0C /* Read: JSON state snapshot */
+#define QUARTZ_CHAR_RELAY_CMD_UUID    0x0A0D /* Write (bonded): CLI-syntax command */
+
 /* Initialize BLE GATT server with mining stats */
 void quartz_ble_init(void);
+
+/* v083: on-demand pair-mode window (BLE for confirmed boards, time-boxed) */
+void quartz_ble_pair_window_start(uint32_t seconds);
+void quartz_ble_stop(void);
+bool quartz_ble_is_active(void);
 
 /* Update mining stats (called from mining loop) */
 void quartz_ble_update_stats(uint32_t hash_count, uint32_t hash_rate,
@@ -52,5 +61,9 @@ void quartz_ble_get_pin_status(bool *has_pin, uint8_t *attempts_left, bool *unlo
 
 /* Provisioning: set the wallet address (already exists, keep it) */
 /* void quartz_ble_set_address(const char *address); — already declared */
+
+/* v087: advertising state + self-heal for the provisioning banner */
+bool quartz_ble_is_advertising(void);
+void quartz_ble_kick_adv(void);
 
 #endif /* QUARTZ_BLE_H */

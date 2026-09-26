@@ -38,7 +38,7 @@ typedef int qz_err_t;
 
 
 #define QUARTZ_VERSION          1
-#define FW_VERSION_STRING      "v073"
+#define FW_VERSION_STRING      "v089.12"
 #define QUARTZ_BLOCK_TIME_SEC   120
 #define QUARTZ_DIFFICULTY_BITS  20      /* starting difficulty */
 #define QUARTZ_RETARGET_PERIOD  144     /* blocks between retargets */

@@ -56,9 +56,9 @@ int g_scratchpad_size = QUARTZ_SCRATCHPAD_SIZE;
 static const char *TAG = "MAIN";
 uint32_t g_last_hps = 0;  /* current hashrate, read by mining_submit */
 
-/* === Testnet Configuration === */
-#define QUARTZ_NODE_HOST "167.233.19.85"
-#define QUARTZ_NODE_PORT 21100
+/* === Testnet Configuration ===
+ * The real node endpoint lives in quartz_wifi.h (NODE_HOST/NODE_PORT) —
+ * override at build time or edit there. */
 
 /* === Buttons ===
  * ESP32 (M5Stack Core): 3 buttons A/B/C on GPIO 39/38/37.
@@ -500,6 +500,79 @@ static void quartz_serial_command(const char *cmd)
                 ESP_LOGI(TAG, "✅ Sent — pending in mempool, mined within ~30s");
             }
         }
+    } else if (strcasecmp(cmd, "wifi") == 0) {
+        /* v078: wipe WiFi + node settings, reboot into portal */
+        nvs_handle_t h;
+        if (nvs_open("qz_wifi", NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_key(h, "ssid");
+            nvs_erase_key(h, "pass");
+            nvs_erase_key(h, "node");
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        ESP_LOGI(TAG, "WiFi cleared — rebooting into portal (Quartz-XXXX AP)");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    } else if (strncasecmp(cmd, "node ", 5) == 0) {
+        /* v078: set node endpoint without wiping anything */
+        const char *spec = cmd + 5;
+        size_t slen = strlen(spec);
+        bool ok = (slen >= 7 && slen < 64);
+        for (size_t i = 0; ok && i < slen; i++) {
+            char cc = spec[i];
+            if (!((cc >= 'a' && cc <= 'z') || (cc >= 'A' && cc <= 'Z') ||
+                  (cc >= '0' && cc <= '9') ||
+                  cc == '.' || cc == ':' || cc == '-' || cc == '/'))
+                ok = false;
+        }
+        if (ok) {
+            nvs_handle_t h;
+            if (nvs_open("qz_wifi", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_str(h, "node", spec);
+                nvs_commit(h);
+                nvs_close(h);
+                ESP_LOGI(TAG, "Node endpoint set to %s — rebooting…", spec);
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
+        } else {
+            ESP_LOGW(TAG, "Usage: node <host[:port]>  (e.g. node 192.168.1.142 or node quartzchain.net)");
+        }
+    } else if (strcasecmp(cmd, "node") == 0) {
+        ESP_LOGI(TAG, "Node endpoint: %s:%d", quartz_wifi_node_host(), quartz_wifi_node_port());
+    } else if (strcasecmp(cmd, "ble on") == 0) {
+        if (!quartz_wallet_is_backup_confirmed()) {
+            ESP_LOGI(TAG, "BLE already on (setup mode) — pair as \"Quartz-Miner\"");
+        } else if (quartz_ble_is_active()) {
+            quartz_ble_pair_window_start(300);
+            ESP_LOGI(TAG, "Pair window extended — 5 more min as \"Quartz-Miner\"");
+        } else {
+            quartz_wifi_set_coex_power();
+            quartz_ble_set_address(quartz_wallet_get_address());
+            quartz_ble_init();
+            quartz_ble_pair_window_start(300);
+            ESP_LOGI(TAG, "Pair window open (5 min) — pair as \"Quartz-Miner\"; 'ble off' closes early");
+        }
+    } else if (strcasecmp(cmd, "ble off") == 0) {
+        if (quartz_ble_is_active() && quartz_wallet_is_backup_confirmed()) {
+            quartz_ble_stop();
+            quartz_wifi_set_full_power();
+        } else {
+            ESP_LOGI(TAG, "BLE setup mode stays on until seed confirmed");
+        }
+    } else if (strcasecmp(cmd, "ble") == 0 || strcasecmp(cmd, "ble status") == 0) {
+        ESP_LOGI(TAG, "BLE: %s%s", quartz_ble_is_active() ? "on — pair as \"Quartz-Miner\"" : "off ('ble on' = 5-min pair window)",
+                 quartz_ble_is_active() && quartz_wallet_is_backup_confirmed() ? " (window)" : " (setup)");
+    } else if (strncasecmp(cmd, "relay", 5) == 0) {
+        /* v079/v089.12: pay-to-trigger relay — one parser, two
+         * transports (serial here, BLE char 0A0D) */
+        const char *rarg = cmd + 5;
+        while (*rarg == ' ') rarg++;
+        if (!quartz_pay_is_initialized())
+            quartz_pay_init(quartz_wallet_get_address());   /* once: re-init disarms */
+        char rreply[192];
+        quartz_pay_relay_cmd(rarg, rreply, sizeof(rreply));
+        ESP_LOGI(TAG, "%s", rreply);
     } else if (strcasecmp(cmd, "help") == 0) {
         ESP_LOGI(TAG, "Commands:");
         ESP_LOGI(TAG, "  address              show wallet address");
@@ -508,6 +581,12 @@ static void quartz_serial_command(const char *cmd)
         ESP_LOGI(TAG, "  send <addr> <amount> sign + broadcast tx (e.g. send Qk... 1.5)");
         ESP_LOGI(TAG, "  setpin/pin <digits>  set or unlock PIN");
         ESP_LOGI(TAG, "  pinstatus            PIN state");
+        ESP_LOGI(TAG, "  node [host[:port]]   show/set node endpoint");
+        ESP_LOGI(TAG, "  wifi                 wipe WiFi + node, reboot to portal");
+        ESP_LOGI(TAG, "  relay [price_qz [sec] [fast|safe]]  pay-to-trigger GPIO relay (0-conf default)");
+        ESP_LOGI(TAG, "  ble [on|off]           pair-mode BLE window (5 min) for app pairing");
+    } else if (cmd[0] != '\0') {
+        ESP_LOGW(TAG, "Unknown command: '%s' — type 'help'", cmd);
     }
 }
 
@@ -556,14 +635,52 @@ static void init_nvs(void) {
 }
 
 /* === Mining Task === */
+/* v088: bring WiFi up in the background once the seed is confirmed, or
+ * after PROVISION_WIFI_FALLBACK_S if the user never confirms (portal
+ * stays reachable for stranded setups). */
+#define PROVISION_WIFI_FALLBACK_S 120
+#define PROVISION_BLE_WINDOW_S    1200  /* v089.10: confirmed but no WiFi creds — BLE-first this long */
+static void deferred_wifi_task(void *arg) {
+    /* v089.10: setup = seed confirmed AND WiFi creds present. The portal
+     * only fires when provisioning truly stalls — a live phone link resets
+     * the idle timer, so BLE provisioning never gets the radio yanked. */
+    int timeout_s = quartz_wallet_is_backup_confirmed() ? PROVISION_BLE_WINDOW_S
+                                                        : PROVISION_WIFI_FALLBACK_S;
+    for (int i = 0; i < timeout_s; i++) {
+        if (quartz_wallet_is_backup_confirmed() && quartz_wifi_has_creds()) break;
+        if (quartz_ble_is_connected()) i = -1;   /* phone linked — keep waiting */
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    quartz_wifi_init();
+    /* v089.11: bring mesh up once WiFi exists — v085 rule stays: never
+     * pre-confirmation (ESP-NOW coex starves BLE discovery). */
+    if (quartz_wallet_is_backup_confirmed()) {
+        quartz_mesh_init();
+        quartz_mesh_update_caps(QZ_CAP_IS_MINING |
+                                (quartz_wifi_is_connected() ? QZ_CAP_HAS_WIFI : 0));
+    }
+    vTaskDelete(NULL);
+}
+
 static void mining_task(void *pvParameters) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  Quartz (QZ) — ESP32 Cryptocurrency Miner");
     ESP_LOGI(TAG, "  Firmware: %s", FW_VERSION_STRING);
     ESP_LOGI(TAG, "  Protocol: %d", QUARTZ_VERSION);
     ESP_LOGI(TAG, "  Target: ESP32-S3 (generic)");
-    ESP_LOGI(TAG, "  Node: %s:%d", QUARTZ_NODE_HOST, QUARTZ_NODE_PORT);
+    ESP_LOGI(TAG, "  Node: %s:%d", quartz_wifi_node_host(), quartz_wifi_node_port());
     ESP_LOGI(TAG, "========================================");
+
+    /* v089: unconfirmed boards run with WiFi deferred (v088) — bring BLE
+     * up BEFORE the entropy gate so the RNG sees a live radio. Without
+     * this, the gate failed at boot and this whole task (seed display,
+     * BLE advertising, the 10s banner, serial/BOOT confirm) silently
+     * self-deleted: the board looked booted but nothing ever advertised. */
+    if (!quartz_wallet_is_backup_confirmed() && !quartz_ble_is_active()) {
+        quartz_wifi_set_coex_power();   /* v089.5: same coex sequence as the proven 'ble on' path */
+        quartz_ble_init();
+        ESP_LOGI(TAG, "BLE up early (provisioning) — radio active for RNG + pairing");
+    }
 
     /* Initialize entropy subsystem */
     ESP_LOGI(TAG, "Waiting for hardware RNG...");
@@ -723,6 +840,19 @@ static void mining_task(void *pvParameters) {
             };
             gpio_config(&boot_btn);
             int boot_hold_ms = 0;
+            int confirm_wait_ms = 0;   /* v078: repeating banner timer */
+
+            /* v084: BLE must advertise BEFORE the wait — fresh devices pair
+             * via app during provisioning (same coex sequence as 'ble on').
+             * Without this, the "pair via app" prompt below is a lie: the
+             * app can never find a device that isn't advertising. */
+            if (!quartz_ble_is_active()) {
+                quartz_wifi_set_coex_power();
+                quartz_ble_init();
+            }
+            /* v089: refresh address even when BLE came up at boot (early init) */
+            quartz_ble_set_address(quartz_wallet_get_address());
+            ESP_LOGI(TAG, "BLE ready (provisioning) — pair as \"Quartz-Miner\"");
 
             /* Wait for confirmation from ANY source — NO TIMEOUT */
             while (!quartz_ble_is_seed_confirmed() &&
@@ -771,6 +901,7 @@ static void mining_task(void *pvParameters) {
                             if (nvs_open("qz_wifi", NVS_READWRITE, &h) == ESP_OK) {
                                 nvs_erase_key(h, "ssid");
                                 nvs_erase_key(h, "pass");
+                                nvs_erase_key(h, "node");
                                 nvs_commit(h);
                                 nvs_close(h);
                             }
@@ -809,6 +940,22 @@ static void mining_task(void *pvParameters) {
                     boot_hold_ms = 0;
                 }
 
+                /* v078: unmissable repeating banner while unconfirmed.
+                 * v089.5: honest BLE state — "NOT advertising" used to hide
+                 * both a dead stack and an active phone link. */
+                confirm_wait_ms += 50;
+                if (confirm_wait_ms >= 10000) {
+                    confirm_wait_ms = 0;
+                    ESP_LOGW(TAG, "⏳ WALLET NOT CONFIRMED — MINING WILL NOT START [BLE: %s]",
+                             quartz_ble_is_connected() ? "CONNECTED — finish backup in the app" :
+                             quartz_ble_is_advertising() ? "advertising — pair in the app" :
+                             quartz_ble_is_active() ? "up, not advertising (kicking)" :
+                                                      "down — auto-retrying");
+                    ESP_LOGW(TAG, "   → Quartz app: pair as \"Quartz-Miner\" and confirm on your phone");
+                    ESP_LOGW(TAG, "   → serial fallback: 'confirm' + Enter (or hold BOOT/PRG 3s)");
+                    quartz_ble_kick_adv();
+                }
+
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
 
@@ -828,6 +975,11 @@ static void mining_task(void *pvParameters) {
 #endif
         }
     }
+
+    /* v085: seed confirmed — bring up the deferred ESP-NOW mesh */
+    quartz_mesh_init();
+    quartz_mesh_update_caps(QZ_CAP_IS_MINING |
+                            (quartz_wifi_is_connected() ? QZ_CAP_HAS_WIFI : 0));
 
     /* Initialize PUF (hardware binding) — NO FALLBACK.
      * If PUF fails, device refuses to mine. Period. */
@@ -877,17 +1029,42 @@ static void mining_task(void *pvParameters) {
     g_scratchpad_size = scratchpad_size;
     ESP_LOGI(TAG, "Scratchpad allocated (%d KB)", scratchpad_size / 1024);
 
-    /* BLE only while seed provisioning might still be needed (v070).
-     * Once backup is confirmed, dedicate the radio to WiFi and kill
-     * modem-sleep coex churn (router evictions). */
-    bool ble_on = !quartz_wallet_is_backup_confirmed();
-    if (ble_on) {
+    /* v089.10: setup isn't done until the miner can reach the node — a
+     * confirmed board with no WiFi creds keeps BLE available so the app
+     * can finish provisioning any time, power-cycles included. */
+    bool setup_done = quartz_wallet_is_backup_confirmed() && quartz_wifi_has_creds();
+    bool ble_on = !setup_done;
+    if (ble_on && quartz_ble_is_active()) {
+        /* v084: BLE already running from the provisioning wait — keep it up */
+        ESP_LOGI(TAG, "BLE ready (from provisioning wait) — pair as \"Quartz-Miner\"");
+    } else if (ble_on) {
         quartz_ble_set_address(quartz_wallet_get_address());
         quartz_ble_init();
-        ESP_LOGI(TAG, "BLE ready — pair as \"Quartz-Miner\"");
+        if (quartz_wifi_has_creds()) {
+            ESP_LOGI(TAG, "BLE ready — pair as \"Quartz-Miner\"");
+        } else {
+            /* v089.10: seed confirmed but unprovisioned — rolling pair
+             * window (extends while the phone stays linked) so WiFi setup
+             * can be finished any time; the portal takes over after it. */
+            quartz_ble_pair_window_start(PROVISION_BLE_WINDOW_S);
+            ESP_LOGI(TAG, "BLE ready (no WiFi creds) — %d s rolling pair window; finish WiFi setup from the app any time", PROVISION_BLE_WINDOW_S);
+        }
     } else {
-        ESP_LOGI(TAG, "BLE off (seed confirmed) — radio dedicated to WiFi");
-        quartz_wifi_set_full_power();
+        /* Confirmed: give the radio back to WiFi full-power mining — but
+         * v089.7: if the phone is still connected (just confirmed in-app),
+         * keep BLE up as a 5-min pair window so live stats keep flowing;
+         * tearing the stack down under a live link half-killed GATTS
+         * (stale reads + BTC error spam). */
+        if (quartz_ble_is_active() && quartz_ble_is_connected()) {
+            quartz_ble_pair_window_start(300);
+            ESP_LOGI(TAG, "Phone connected post-confirm — BLE serves stats 5 min, then radio goes to WiFi ('ble on' reopens)");
+        } else {
+            if (quartz_ble_is_active()) {
+                quartz_ble_stop();
+            }
+            ESP_LOGI(TAG, "BLE off (seed confirmed) — radio dedicated to WiFi ('ble on' = 5-min pair window)");
+            quartz_wifi_set_full_power();
+        }
     }
 
     /* If PIN is set, show PIN entry screen before mining starts */
@@ -957,8 +1134,9 @@ static void mining_task(void *pvParameters) {
                 last_work_fetch = now;
                 ESP_LOGI(TAG, "📡 Got work: block %d, target %d",
                          tmpl.height, tmpl.target_bits);
-                /* Share work with mesh peers */
-                quartz_mesh_share_work(&tmpl);
+                quartz_mesh_update_height(tmpl.height);   /* v078 */
+                /* v076: no verbatim sharing — peers request work paying
+                 * their own address instead (per-board payouts) */
             } else {
                 /* Fallback to local mining if node unreachable */
                 if (!have_work) {
@@ -967,14 +1145,28 @@ static void mining_task(void *pvParameters) {
             }
         }
 
-        /* If no WiFi, try to get work from mesh peers */
-        if (!have_work && quartz_mesh_is_active()) {
-            if (quartz_mesh_get_work(&tmpl) == 0) {
+        /* v076: mesh work with per-board payouts. When idle (headless, or
+         * node unreachable), broadcast a WORK_REQ carrying OUR wallet
+         * address; a connected peer fetches a template paying US and sends
+         * it directed. Drop + re-request stale work so finds aren't
+         * orphaned on an old template. */
+        if (quartz_mesh_is_active()) {
+            if (have_work && (now - last_work_fetch) > 45) {
+                have_work = false;  /* stale — ask for fresh */
+            }
+            if (!have_work) {
+                static uint32_t last_req = 0;
+                if ((uint32_t)(now - last_req) >= 10) {
+                    last_req = now;
+                    quartz_mesh_request_work(quartz_wallet_get_address());
+                }
+            }
+            if (!have_work && quartz_mesh_get_work(&tmpl) == 0) {
                 memcpy(header, tmpl.header, 80);
                 nonce = 0;
                 have_work = true;
                 last_work_fetch = now;
-                ESP_LOGI(TAG, "📡 Got work via mesh: block %d, target %d",
+                ESP_LOGI(TAG, "📡 Got work via mesh (pays us): block %d, target %d",
                          tmpl.height, tmpl.target_bits);
             }
         }
@@ -1069,6 +1261,17 @@ static void mining_task(void *pvParameters) {
             g_last_hps = hps;
             /* Serial log once a minute — display keeps refreshing every pass,
              * but the console no longer drowns out typed commands */
+            {   /* v079/v080: pay-to-trigger watch — v080 fix: hoisted out of
+                 * the once-a-minute log gate so the 5 s poll cadence is real */
+                static bool s_pay_inited = false;
+                static uint32_t s_last_pay_poll_s = 0;
+                if (!s_pay_inited) { quartz_pay_init(quartz_wallet_get_address()); s_pay_inited = true; }
+                uint32_t pay_now_s = xTaskGetTickCount() / pdMS_TO_TICKS(1000);
+                if (pay_now_s - s_last_pay_poll_s >= 5) {
+                    s_last_pay_poll_s = pay_now_s;
+                    quartz_pay_poll();
+                }
+            }
             static uint32_t s_last_log_uptime = 0;
             if (uptime - s_last_log_uptime >= 60) {
                 s_last_log_uptime = uptime;
@@ -1114,6 +1317,19 @@ static void mining_task(void *pvParameters) {
                         ESP_LOGI(TAG, "✅ Mesh block relayed successfully!");
                     } else {
                         ESP_LOGW(TAG, "Mesh block relay failed (%d)", rc);
+                    }
+                }
+
+                /* v076: serve pending work request — fetch a template
+                 * paying the REQUESTER's address, send it directed */
+                char req_addr[40];
+                uint8_t req_mac[6];
+                if (quartz_mesh_get_work_req(req_addr, req_mac) == 0) {
+                    qz_block_template_t rt;
+                    if (quartz_mining_get_work_for(req_addr, &rt) == 0) {
+                        quartz_mesh_send_work_to(req_mac, &rt);
+                        ESP_LOGI(TAG, "📡 Served work req (block %d) → %s",
+                                 rt.height, req_addr);
                     }
                 }
             }
@@ -1188,13 +1404,24 @@ void app_main(void) {
 #endif
 
     /* Initialize WiFi (provisioning or connect) */
-    quartz_wifi_init();
+    /* v088: BLE gets the radio ALONE during seed provisioning — WiFi+BLE
+     * coex starves advertising at the arbiter (controller reports success,
+     * air stays silent; two independent scanners confirmed). Unconfirmed
+     * boards defer WiFi to a background task: starts the moment the seed
+     * is confirmed, or PROVISION_WIFI_FALLBACK_S as a portal fallback. */
+    bool wifi_deferred = !(quartz_wallet_is_backup_confirmed() && quartz_wifi_has_creds());  /* v089.10 */
+    if (wifi_deferred) {
+        ESP_LOGI(TAG, "Setup incomplete (seed or WiFi) — WiFi deferred, radio dedicated to BLE");
+        xTaskCreate(deferred_wifi_task, "qz_wifi_defer", 3072, NULL, 3, NULL);
+    } else {
+        quartz_wifi_init();
+    }
 
     /* Wait for radio to warm up */
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    if (!wifi_deferred) vTaskDelay(pdMS_TO_TICKS(2000));
 
     /* If in portal mode, show instructions on display */
-    if (g_wifi_state == QZ_WIFI_PORTAL_ACTIVE) {
+    if (!wifi_deferred && g_wifi_state == QZ_WIFI_PORTAL_ACTIVE) {
         uint8_t mac[6];
         esp_wifi_get_mac(WIFI_IF_AP, mac);
         char ap_name[32];
@@ -1207,19 +1434,28 @@ void app_main(void) {
     }
 
     /* Wait for WiFi (or stay in portal mode forever) */
-    if (g_wifi_state != QZ_WIFI_PORTAL_ACTIVE) {
+    if (!wifi_deferred && g_wifi_state != QZ_WIFI_PORTAL_ACTIVE) {
 #ifdef QUARTZ_HAS_DISPLAY
         quartz_display_connecting();
 #endif
         quartz_wifi_wait_connected(15000);
     }
 
-    /* Initialize ESP-NOW mesh (after WiFi is up) */
-    if (quartz_wifi_is_connected()) {
+    /* v085: defer ESP-NOW mesh until seed confirmed — mesh RX windows +
+     * portal AP + BLE advertising share one radio; ESP-NOW coex starves BLE
+     * discovery during provisioning. Mesh has no use pre-confirmation
+     * (mining won't start) and quartz_mesh_init() is idempotent. */
+    if (!quartz_wallet_is_backup_confirmed()) {
+        ESP_LOGI(TAG, "Mesh deferred (seed unconfirmed) — radio reserved for BLE + portal");
+    } else if (wifi_deferred) {
+        /* v089.11: confirmed but no WiFi creds — WiFi driver not up yet
+         * (v089.10 deferred it for BLE provisioning); the deferred task
+         * brings mesh up after WiFi initializes. */
+        ESP_LOGI(TAG, "Mesh deferred (WiFi unprovisioned) — radio reserved for BLE");
+    } else if (quartz_wifi_is_connected()) {
         quartz_mesh_init();
         quartz_mesh_update_caps(QZ_CAP_HAS_WIFI | QZ_CAP_IS_MINING);
     } else {
-        /* Still init mesh — we can receive work from peers without WiFi */
         quartz_mesh_init();
         quartz_mesh_update_caps(QZ_CAP_IS_MINING);
     }

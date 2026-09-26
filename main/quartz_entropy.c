@@ -14,6 +14,9 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#if CONFIG_BT_ENABLED
+#include "esp_bt.h"
+#endif
 #include "esp_adc/adc_oneshot.h"
 #include "mbedtls/sha256.h"
 #else
@@ -54,9 +57,16 @@ qz_err_t quartz_entropy_wait_for_ready(void) {
     bool wifi_on = (esp_wifi_get_mode(&wifi_mode) == ESP_OK &&
                     wifi_mode != WIFI_MODE_NULL);
 
-    /* BT status check removed — esp_bt.h include varies by target.
-     * For RNG purposes, WiFi being on is sufficient. */
-    bool bt_on = false;  /* TODO: detect BT status per-target */
+    /* v089: real BT detection (was a stub). v088 deferred WiFi during
+     * provisioning, so mining_task booted with NO radio on, this gate
+     * failed, and the task (seed display + BLE + confirm loop) silently
+     * self-deleted at boot — board came up dead to every scanner. */
+#if CONFIG_BT_ENABLED
+    bool bt_on = (esp_bt_controller_get_status() ==
+                  ESP_BT_CONTROLLER_STATUS_ENABLED);
+#else
+    bool bt_on = false;
+#endif
 
     if (!wifi_on && !bt_on) {
         ESP_LOGE(TAG, "⚠️ No radio active! Cannot guarantee hardware RNG entropy.");
